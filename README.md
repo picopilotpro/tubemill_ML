@@ -71,7 +71,7 @@ python tube_mill_eda.py ^
 - `machine_efficiency_summary.csv`
 - `production_runs_enriched.csv`
 - `downtime_events_enriched.csv` (when downtime data is supplied)
-- `eda_report.html` (self-contained report; machine rankings/bands are withheld when data is insufficient)
+- `eda_report.html` (self-contained report with available business KPIs and plant-wide daily run counts, run durations, downtime, and energy; machine rankings/bands are withheld when data is insufficient)
 - `run_efficiency_band_mapping.csv` (if linkable run IDs exist)
 - `process_parameter_summary.csv` (per-tag profile from production-linked process readings)
 - `process_factor_gap_by_tag.csv` (if process parameter mapping exists)
@@ -80,7 +80,13 @@ python tube_mill_eda.py ^
   - `output_vs_energy.png`
   - `machine_metric_correlation_heatmap.png`
   - `top_downtime_reasons.png` (downtime hours and matched EMS energy by loss reason; energy uses a secondary axis)
+  - `daily_downtime_vs_energy.png` (paired daily bars in one chart with separate downtime and energy scales; energy is shown in MWh, and each metric is assigned to its event/run start date)
   - `process_parameter_gap.png`
+
+The daily signal summary compares dates with both energy and downtime values against
+their respective medians. Values above the median are higher; values at or below it
+are lower. Days missing either metric are excluded, and the resulting categories are
+relative signals rather than fixed performance targets.
 
 ### local run
 

@@ -12,6 +12,7 @@ from datetime import time as datetime_time
 from pathlib import Path
 from typing import Optional
 
+import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -787,11 +788,108 @@ def compute_machine_efficiency(
     return prod, machine_summary
 
 
+def create_daily_summary(
+    production_runs: pd.DataFrame,
+    downtime_df: Optional[pd.DataFrame],
+    downtime_duration_unit: Optional[str] = None,
+) -> pd.DataFrame:
+    daily_summary = pd.DataFrame()
+    production_start_col = first_existing_column(
+        production_runs, ["prod_start_time", "begin_time", "start_time"]
+    )
+    if production_start_col:
+        run_daily = pd.DataFrame(
+            {
+                "date": pd.to_datetime(
+                    production_runs[production_start_col], errors="coerce"
+                ).dt.normalize(),
+                "production_runs": 1,
+            }
+        )
+        energy_col = first_existing_column(production_runs, ["energy_kwh"])
+        if energy_col:
+            run_daily["energy_kwh"] = pd.to_numeric(
+                production_runs[energy_col], errors="coerce"
+            )
+        run_hours_col = first_existing_column(production_runs, ["run_hours"])
+        if run_hours_col:
+            run_daily["run_hours"] = pd.to_numeric(
+                production_runs[run_hours_col], errors="coerce"
+            )
+        run_daily = run_daily.dropna(subset=["date"])
+        if not run_daily.empty:
+            aggregations = {"production_runs": ("production_runs", "sum")}
+            if energy_col:
+                aggregations["energy_kwh"] = (
+                    "energy_kwh",
+                    lambda values: values.sum(min_count=1),
+                )
+            if run_hours_col:
+                aggregations["run_hours"] = (
+                    "run_hours",
+                    lambda values: values.sum(min_count=1),
+                )
+            daily_summary = (
+                run_daily.groupby("date", as_index=False)
+                .agg(**aggregations)
+            )
+
+    if downtime_df is not None and not downtime_df.empty:
+        downtime_start_col = first_existing_column(
+            downtime_df,
+            ["begin_time", "downtime_start_time", "start_time", "event_start_time"],
+        )
+        duration_col = first_existing_column(downtime_df, ["duration"])
+        if downtime_start_col and duration_col:
+            down_daily = pd.DataFrame(
+                {
+                    "date": pd.to_datetime(
+                        downtime_df[downtime_start_col], errors="coerce"
+                    ).dt.normalize(),
+                    "downtime_hours": duration_to_hours(
+                        downtime_df[duration_col], downtime_duration_unit
+                    ),
+                }
+            ).dropna(subset=["date"])
+            if not down_daily.empty:
+                down_daily = (
+                    down_daily.groupby("date", as_index=False)
+                    .agg(
+                        downtime_hours=(
+                            "downtime_hours",
+                            lambda values: values.sum(min_count=1),
+                        )
+                    )
+                )
+                daily_summary = (
+                    down_daily
+                    if daily_summary.empty
+                    else daily_summary.merge(down_daily, on="date", how="outer")
+                )
+
+    if daily_summary.empty:
+        return pd.DataFrame(
+            columns=[
+                "date",
+                "production_runs",
+                "run_hours",
+                "energy_kwh",
+                "downtime_hours",
+            ]
+        )
+    if "production_runs" in daily_summary:
+        daily_summary["production_runs"] = (
+            daily_summary["production_runs"].fillna(0).astype(int)
+        )
+    return daily_summary.sort_values("date").reset_index(drop=True)
+
+
 def create_plots(
     machine_summary: pd.DataFrame,
     downtime_df: Optional[pd.DataFrame],
     output_dir: Path,
     downtime_duration_unit: Optional[str] = None,
+    daily_summary: Optional[pd.DataFrame] = None,
 ) -> None:
     sns.set_theme(style="whitegrid")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -802,6 +900,7 @@ def create_plots(
         "machine_metric_correlation_heatmap.png",
         "top_downtime_reasons.png",
         "process_parameter_gap.png",
+        "daily_downtime_vs_energy.png",
     ]
     for filename in chart_paths:
         chart_path = output_dir / filename
@@ -954,6 +1053,61 @@ def create_plots(
                 plt.savefig(output_dir / "top_downtime_reasons.png", dpi=150)
                 plt.close()
 
+    if daily_summary is not None and not daily_summary.empty:
+        has_downtime = (
+            "downtime_hours" in daily_summary
+            and daily_summary["downtime_hours"].notna().any()
+        )
+        has_energy = (
+            "energy_kwh" in daily_summary
+            and daily_summary["energy_kwh"].notna().any()
+        )
+        if has_downtime and has_energy:
+            dates = pd.to_datetime(daily_summary["date"])
+            date_numbers = mdates.date2num(dates.dt.to_pydatetime())
+            bar_width = 0.35
+            fig, downtime_axis = plt.subplots(figsize=(12, 6))
+            downtime_bars = downtime_axis.bar(
+                date_numbers - bar_width / 2,
+                daily_summary["downtime_hours"],
+                width=bar_width,
+                color="#9b59b6",
+                label="Downtime (hours)",
+            )
+            downtime_axis.set_ylabel("Downtime (hours)")
+            downtime_axis.grid(axis="y", alpha=0.3)
+            downtime_axis.set_axisbelow(True)
+
+            energy_axis = downtime_axis.twinx()
+            energy_bars = energy_axis.bar(
+                date_numbers + bar_width / 2,
+                daily_summary["energy_kwh"] / 1000,
+                width=bar_width,
+                color="#e67e22",
+                label="Matched production energy (MWh)",
+            )
+            energy_axis.set_ylabel("Matched production energy (MWh)")
+            energy_axis.set_ylim(bottom=0)
+
+            downtime_axis.legend(
+                [downtime_bars, energy_bars],
+                ["Downtime (hours)", "Matched production energy (MWh)"],
+                loc="upper right",
+            )
+            downtime_axis.set_title("Daily Downtime vs Matched Production Energy")
+            downtime_axis.set_xlabel("Date")
+            downtime_axis.xaxis.set_major_locator(
+                mdates.WeekdayLocator(byweekday=mdates.MO, interval=1)
+            )
+            downtime_axis.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
+            downtime_axis.set_xlim(
+                date_numbers.min() - 0.5,
+                date_numbers.max() + 0.5,
+            )
+            fig.tight_layout()
+            plt.savefig(output_dir / "daily_downtime_vs_energy.png", dpi=150)
+            plt.close()
+
 
 def create_factor_tables(
     production_runs: pd.DataFrame,
@@ -1070,7 +1224,6 @@ def create_factor_tables(
     plt.savefig(output_dir / "process_parameter_gap.png", dpi=150)
     plt.close()
 
-
 def create_html_report(
     production_runs: pd.DataFrame,
     machine_summary: pd.DataFrame,
@@ -1079,7 +1232,13 @@ def create_html_report(
     production_duration_unit: Optional[str] = None,
     downtime_duration_unit: Optional[str] = None,
     ems_df: Optional[pd.DataFrame] = None,
+    daily_summary: Optional[pd.DataFrame] = None,
 ) -> Path:
+    if daily_summary is None:
+        daily_summary = create_daily_summary(
+            production_runs, downtime_df, downtime_duration_unit
+        )
+
     def format_number(value: object, digits: int = 2) -> str:
         number = pd.to_numeric(value, errors="coerce")
         return "N/A" if pd.isna(number) else f"{number:,.{digits}f}"
@@ -1228,6 +1387,177 @@ def create_html_report(
                 .head(10)
                 .reset_index()
                 .rename(columns={loss_col: "loss_reason"})
+            )
+
+    business_summary_metrics = []
+
+    def add_business_metric(label: str, value: object, digits: int = 2, suffix: str = "") -> None:
+        number = pd.to_numeric(value, errors="coerce")
+        if pd.isna(number) or not np.isfinite(number):
+            return
+        business_summary_metrics.append(
+            f"<div class='card'>{html.escape(label)}"
+            f"<strong>{format_number(number, digits)}{html.escape(suffix)}</strong></div>"
+        )
+
+    def total_metric(column: str) -> object:
+        if column not in machine_summary.columns:
+            return np.nan
+        values = pd.to_numeric(machine_summary[column], errors="coerce").replace(
+            [np.inf, -np.inf], np.nan
+        )
+        return values.sum(min_count=1)
+
+    if len(production_runs):
+        add_business_metric("Production runs", len(production_runs), digits=0)
+    if "production_runs" in daily_summary.columns:
+        add_business_metric(
+            "Days with production",
+            daily_summary["production_runs"].gt(0).sum(),
+            digits=0,
+        )
+
+    produced_qty = total_metric("produced_qty")
+    scrap_qty = total_metric("scrap_qty")
+    add_business_metric("Produced quantity", produced_qty)
+    add_business_metric("Scrap quantity", scrap_qty)
+    if pd.notna(produced_qty) and pd.notna(scrap_qty):
+        total_output = produced_qty + scrap_qty
+        if total_output > 0:
+            add_business_metric("Scrap rate", scrap_qty / total_output * 100, suffix="%")
+
+    if "speed_attainment_pct" in production_runs.columns:
+        speed_values = pd.to_numeric(
+            production_runs["speed_attainment_pct"], errors="coerce"
+        ).replace([np.inf, -np.inf], np.nan)
+        if speed_values.notna().any():
+            add_business_metric("Average speed vs target", speed_values.mean(), suffix="%")
+
+    if {"energy_kwh", "pq_qty_clean"}.issubset(production_runs.columns):
+        run_energy = pd.to_numeric(production_runs["energy_kwh"], errors="coerce")
+        run_output = pd.to_numeric(production_runs["pq_qty_clean"], errors="coerce")
+        matched_runs = run_energy.notna() & run_output.notna() & (run_output > 0)
+        if matched_runs.any():
+            matched_output = run_output.loc[matched_runs].sum()
+            if matched_output > 0:
+                add_business_metric(
+                    "Matched energy per unit",
+                    run_energy.loc[matched_runs].sum() / matched_output,
+                    suffix=" kWh/unit",
+                )
+
+    add_business_metric("Recorded downtime", total_metric("downtime_hours"), suffix=" hours")
+    if not downtime_table.empty:
+        top_downtime = downtime_table.iloc[0]
+        reason = top_downtime.get("loss_reason")
+        hours = pd.to_numeric(top_downtime.get("downtime_hours"), errors="coerce")
+        if pd.notna(reason) and str(reason).strip() and pd.notna(hours) and np.isfinite(hours):
+            business_summary_metrics.append(
+                f"<div class='card'>Largest downtime reason"
+                f"<strong>{html.escape(str(reason))} ({format_number(hours)} hours)</strong></div>"
+            )
+    business_summary_html = (
+        "<div class='cards'>" + "".join(business_summary_metrics) + "</div>"
+        if business_summary_metrics
+        else "<p class='empty'>No business metrics are available from the supplied data.</p>"
+    )
+    daily_report = daily_summary.copy()
+    if not daily_report.empty and "date" in daily_report:
+        daily_report["date"] = pd.to_datetime(
+            daily_report["date"], errors="coerce"
+        ).dt.strftime("%Y-%m-%d")
+        daily_columns = ["date"]
+        daily_labels = {
+            "date": "Date",
+            "production_runs": "Production runs",
+            "run_hours": "Run time (hours)",
+            "downtime_hours": "Downtime (hours)",
+            "energy_kwh": "Matched production energy (kWh)",
+        }
+        for column in (
+            "production_runs",
+            "run_hours",
+            "downtime_hours",
+            "energy_kwh",
+        ):
+            if column in daily_report and (
+                column == "production_runs" or daily_report[column].notna().any()
+            ):
+                daily_columns.append(column)
+        daily_table_html = table_html(
+            daily_report, daily_columns, labels=daily_labels
+        )
+    else:
+        daily_table_html = (
+            "<p class='empty'>No production or downtime start dates are available.</p>"
+        )
+    daily_chart_html = image_html(
+        "daily_downtime_vs_energy.png",
+        "Daily downtime vs matched production energy",
+    )
+    if not daily_chart_html:
+        daily_chart_html = (
+            "<p class='empty'>The daily chart requires both downtime durations and "
+            "matched production energy data.</p>"
+        )
+    daily_signal_html = (
+        "<p class='empty'>Daily signals require both valid energy and downtime values.</p>"
+    )
+    if (
+        not daily_summary.empty
+        and {"energy_kwh", "downtime_hours"}.issubset(daily_summary.columns)
+    ):
+        daily_values = daily_summary[["energy_kwh", "downtime_hours"]].apply(
+            pd.to_numeric, errors="coerce"
+        ).replace([np.inf, -np.inf], np.nan)
+        comparable_days = daily_values.loc[
+            daily_values.notna().all(axis=1) & (daily_values >= 0).all(axis=1)
+        ]
+        if not comparable_days.empty:
+            energy_median = comparable_days["energy_kwh"].median()
+            downtime_median = comparable_days["downtime_hours"].median()
+            high_energy = comparable_days["energy_kwh"] > energy_median
+            high_downtime = comparable_days["downtime_hours"] > downtime_median
+            signal_rows = [
+                {
+                    "pattern": "Higher energy, lower downtime",
+                    "days": int((high_energy & ~high_downtime).sum()),
+                    "interpretation": "Needs attention: review energy use",
+                },
+                {
+                    "pattern": "Lower energy, higher downtime",
+                    "days": int((~high_energy & high_downtime).sum()),
+                    "interpretation": "Low energy may be caused by downtime; investigate",
+                },
+                {
+                    "pattern": "Higher energy, higher downtime",
+                    "days": int((high_energy & high_downtime).sum()),
+                    "interpretation": "Investigate both measures",
+                },
+                {
+                    "pattern": "Lower energy, lower downtime",
+                    "days": int((~high_energy & ~high_downtime).sum()),
+                    "interpretation": "Favorable operating signal",
+                },
+            ]
+            signal_table_html = table_html(
+                pd.DataFrame(signal_rows),
+                ["pattern", "days", "interpretation"],
+                digits=0,
+                labels={
+                    "pattern": "Daily pattern",
+                    "days": "Days",
+                    "interpretation": "Business interpretation",
+                },
+            )
+            daily_signal_html = (
+                f"<p>Out of {len(daily_summary)} dates in the table, "
+                f"{len(comparable_days)} had both metrics available. Higher means above "
+                f"the comparable-day median ({format_number(energy_median / 1000)} MWh "
+                f"energy, {format_number(downtime_median)} downtime hours); lower means "
+                "at or below the median. These are relative signals, not fixed targets; "
+                "energy is not adjusted for production volume.</p>"
+                f"<div class='table-wrap'>{signal_table_html}</div>"
             )
 
     factor_path = output_dir / "process_factor_gap_by_tag.csv"
@@ -1875,6 +2205,18 @@ def create_html_report(
       {findings_html}
     </section>
     <section>
+      <h2>Business summary</h2>
+      {business_summary_html}
+    </section>
+    <section>
+      <h2>Daily operating trends</h2>
+      <p class="muted">Plant-wide daily totals. Run duration and matched energy are assigned to each production run's start date; downtime duration is assigned to each event's start date. Energy is matched by time window, not by meter-to-machine ID. Overlapping production windows may count energy more than once.</p>
+      <div class="table-wrap">{daily_table_html}</div>
+      {daily_chart_html}
+      <h3>Daily signal summary</h3>
+      {daily_signal_html}
+    </section>
+    <section>
       <h2>Machine metrics</h2>
       <p class="muted">Machine-level descriptive metrics. A relative score is shown only when at least two machines have complete score inputs; efficiency bands require at least four.</p>
       <div class="table-wrap">{machine_table_html}</div>
@@ -2044,6 +2386,11 @@ def main() -> None:
         production_duration_unit=args.production_duration_unit,
         downtime_duration_unit=args.downtime_duration_unit,
     )
+    daily_summary = create_daily_summary(
+        production_runs,
+        downtime_df if not downtime_df.empty else None,
+        args.downtime_duration_unit,
+    )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     machine_summary.to_csv(output_dir / "machine_efficiency_summary.csv", index=False)
@@ -2064,6 +2411,7 @@ def main() -> None:
         downtime_df=downtime_df if not downtime_df.empty else None,
         output_dir=output_dir,
         downtime_duration_unit=args.downtime_duration_unit,
+        daily_summary=daily_summary,
     )
     print("[Report] generating HTML...", flush=True)
     report_path = create_html_report(
@@ -2074,6 +2422,7 @@ def main() -> None:
         production_duration_unit=args.production_duration_unit,
         downtime_duration_unit=args.downtime_duration_unit,
         ems_df=ems_df if not ems_df.empty else None,
+        daily_summary=daily_summary,
     )
 
     print("\nEDA complete.")
