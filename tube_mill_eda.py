@@ -884,6 +884,95 @@ def create_daily_summary(
     return daily_summary.sort_values("date").reset_index(drop=True)
 
 
+def summarize_process_tags_for_dates(
+    production_runs: pd.DataFrame,
+    process_df: Optional[pd.DataFrame],
+    dates: pd.Series,
+) -> pd.DataFrame:
+    if process_df is None or process_df.empty or dates.empty:
+        return pd.DataFrame()
+
+    run_id_col = first_existing_column(
+        production_runs, ["product_ref_id", "transaction_id"]
+    )
+    run_start_col = first_existing_column(
+        production_runs, ["prod_start_time", "begin_time", "start_time"]
+    )
+    process_run_id_col = first_existing_column(
+        process_df, ["transaction_id", "product_ref_id"]
+    )
+    tag_col = first_existing_column(process_df, ["_name", "name"])
+    value_col = first_existing_column(process_df, ["_value", "value"])
+    if not all(
+        (run_id_col, run_start_col, process_run_id_col, tag_col, value_col)
+    ):
+        return pd.DataFrame()
+
+    selected_dates = pd.to_datetime(dates, errors="coerce").dropna().dt.normalize()
+    if selected_dates.empty:
+        return pd.DataFrame()
+
+    run_dates = pd.to_datetime(
+        production_runs[run_start_col], errors="coerce"
+    ).dt.normalize()
+    selected_run_ids = production_runs.loc[
+        run_dates.isin(selected_dates), run_id_col
+    ].dropna().astype("string")
+    if selected_run_ids.empty:
+        return pd.DataFrame()
+
+    tagged = (
+        process_df[[process_run_id_col, tag_col, value_col]]
+        .rename(
+            columns={
+                process_run_id_col: "run_id",
+                tag_col: "tag",
+                value_col: "tag_value",
+            }
+        )
+    )
+    tagged["run_id"] = tagged["run_id"].astype("string")
+    tagged["tag_value"] = pd.to_numeric(tagged["tag_value"], errors="coerce")
+    tagged = tagged.loc[
+        tagged["run_id"].isin(selected_run_ids)
+        & tagged["tag"].notna()
+        & tagged["tag_value"].notna()
+    ]
+    if tagged.empty:
+        return pd.DataFrame()
+
+    per_run = (
+        tagged.groupby(["run_id", "tag"], dropna=False)
+        .agg(run_mean=("tag_value", "mean"))
+        .reset_index()
+    )
+    summary = (
+        per_run.groupby("tag", dropna=False)
+        .agg(
+            linked_run_count=("run_id", "nunique"),
+            mean_run_value=("run_mean", "mean"),
+            max_run_value=("run_mean", "max"),
+        )
+        .reset_index()
+    )
+    tag_names = summary["tag"].astype("string")
+    summary["category"] = np.select(
+        [
+            tag_names.str.contains(r"power|kw|kwh|watt", case=False, regex=True, na=False),
+            tag_names.str.contains(r"coolant|flow|pressure", case=False, regex=True, na=False),
+            tag_names.str.contains(r"temp|temperature", case=False, regex=True, na=False),
+        ],
+        ["Power", "Coolant", "Temperature"],
+        default="Other",
+    )
+    summary = summary.loc[summary["category"] != "Other"]
+    return summary.sort_values(
+        ["category", "mean_run_value", "linked_run_count"],
+        ascending=[True, False, False],
+        na_position="last",
+    ).head(8).reset_index(drop=True)
+
+
 def create_plots(
     machine_summary: pd.DataFrame,
     downtime_df: Optional[pd.DataFrame],
@@ -1233,6 +1322,7 @@ def create_html_report(
     downtime_duration_unit: Optional[str] = None,
     ems_df: Optional[pd.DataFrame] = None,
     daily_summary: Optional[pd.DataFrame] = None,
+    process_df: Optional[pd.DataFrame] = None,
 ) -> Path:
     if daily_summary is None:
         daily_summary = create_daily_summary(
@@ -1253,11 +1343,26 @@ def create_html_report(
         if frame.empty or not available:
             return "<p class='empty'>No applicable data available.</p>"
         display = frame[available].copy()
-        formatters_by_source = {
-            column: (lambda value: format_number(value, digits))
-            for column in available
-            if pd.api.types.is_numeric_dtype(display[column])
-        }
+        formatters_by_source = {}
+        for column in available:
+            if not pd.api.types.is_numeric_dtype(display[column]):
+                continue
+            if column in {
+                "linked_run_count",
+                "reading_count",
+                "production_runs",
+                "runs_efficient",
+                "runs_inefficient",
+                "ems_row_matches",
+                "events_with_ems_rows",
+            }:
+                formatters_by_source[column] = (
+                    lambda value: format_number(value, 0)
+                )
+            else:
+                formatters_by_source[column] = (
+                    lambda value: format_number(value, digits)
+                )
         display = display.rename(columns=labels or {})
         formatters = {
             (labels or {}).get(column, column): formatter
@@ -1345,19 +1450,26 @@ def create_html_report(
         else "<p>No machine-level findings could be calculated.</p>"
     )
 
-    chart_files = [
-        ("efficiency_score_by_machine.png", "Efficiency score by machine"),
-        ("output_vs_energy.png", "Output versus energy intensity"),
-        ("machine_metric_correlation_heatmap.png", "Correlation between machine-level metrics"),
-        ("top_downtime_reasons.png", "Top downtime reasons"),
-        ("process_parameter_gap.png", "Process parameter gaps by efficiency band"),
-    ]
-    charts_html = "".join(image_html(filename, title) for filename, title in chart_files)
-    if not charts_html:
-        charts_html = (
-            "<p class='empty'>No comparison charts were generated. Machine score charts require at least "
-            "two distinguishable scores; correlation charts require at least three machines.</p>"
-        )
+    efficiency_chart_html = image_html(
+        "efficiency_score_by_machine.png",
+        "Efficiency score by machine",
+    )
+    machine_correlation_chart_html = image_html(
+        "machine_metric_correlation_heatmap.png",
+        "Correlation between machine-level metrics",
+    )
+    output_energy_chart_html = image_html(
+        "output_vs_energy.png",
+        "Output versus energy intensity",
+    )
+    downtime_chart_html = image_html(
+        "top_downtime_reasons.png",
+        "Top downtime reasons",
+    )
+    process_gap_chart_html = image_html(
+        "process_parameter_gap.png",
+        "Process parameter gaps by efficiency band",
+    )
 
     downtime_table = pd.DataFrame()
     if downtime_df is not None and not downtime_df.empty:
@@ -1503,6 +1615,7 @@ def create_html_report(
     daily_signal_html = (
         "<p class='empty'>Daily signals require both valid energy and downtime values.</p>"
     )
+    process_tag_html = ""
     if (
         not daily_summary.empty
         and {"energy_kwh", "downtime_hours"}.issubset(daily_summary.columns)
@@ -1550,6 +1663,46 @@ def create_html_report(
                     "interpretation": "Business interpretation",
                 },
             )
+            selected_dates = daily_summary.loc[
+                comparable_days.index[high_energy & ~high_downtime], "date"
+            ]
+            process_tag_summary = summarize_process_tags_for_dates(
+                production_runs,
+                process_df,
+                selected_dates,
+            )
+            if process_tag_summary.empty:
+                process_tag_html = (
+                    "<p class='empty'>No process tags are linked to production runs "
+                    "starting on the higher-energy, lower-downtime dates.</p>"
+                )
+            else:
+                process_tag_html = (
+                    "<p class='muted'>Mean process-tag reading for production runs "
+                    "starting on the higher-energy, lower-downtime dates. This ranks "
+                    "process tags within compatible categories, not meter kWh. Values use "
+                    "each tag's source units and should not be compared across categories.</p>"
+                    "<div class='table-wrap'>"
+                    + table_html(
+                        process_tag_summary,
+                        [
+                            "category",
+                            "tag",
+                            "linked_run_count",
+                            "mean_run_value",
+                            "max_run_value",
+                        ],
+                        digits=3,
+                        labels={
+                            "category": "Category",
+                            "tag": "Process tag",
+                            "linked_run_count": "Linked runs",
+                            "mean_run_value": "Mean of run averages",
+                            "max_run_value": "Highest run average",
+                        },
+                    )
+                    + "</div>"
+                )
             daily_signal_html = (
                 f"<p>Out of {len(daily_summary)} dates in the table, "
                 f"{len(comparable_days)} had both metrics available. Higher means above "
@@ -1558,6 +1711,8 @@ def create_html_report(
                 "at or below the median. These are relative signals, not fixed targets; "
                 "energy is not adjusted for production volume.</p>"
                 f"<div class='table-wrap'>{signal_table_html}</div>"
+                "<h4>Process tags for higher-energy, lower-downtime dates</h4>"
+                f"{process_tag_html}"
             )
 
     factor_path = output_dir / "process_factor_gap_by_tag.csv"
@@ -1578,6 +1733,50 @@ def create_html_report(
     report_machines["scrap_rate_pct"] = report_machines["scrap_rate"] * 100
     report_machines["availability_pct"] = report_machines["availability"] * 100
     report_machines["downtime_rate_pct"] = report_machines["downtime_rate"] * 100
+    glance_days = (
+        int(daily_summary["production_runs"].gt(0).sum())
+        if "production_runs" in daily_summary.columns
+        else 0
+    )
+    glance_output = pd.to_numeric(
+        machine_summary["produced_qty"], errors="coerce"
+    ).sum(min_count=1) if "produced_qty" in machine_summary.columns else np.nan
+    glance_scrap = pd.to_numeric(
+        machine_summary["scrap_qty"], errors="coerce"
+    ).sum(min_count=1) if "scrap_qty" in machine_summary.columns else np.nan
+    glance_total = (
+        glance_output + glance_scrap
+        if pd.notna(glance_output) and pd.notna(glance_scrap)
+        else np.nan
+    )
+    glance_scrap_rate = (
+        glance_scrap / glance_total * 100
+        if pd.notna(glance_total) and glance_total > 0
+        else np.nan
+    )
+    glance_downtime = pd.to_numeric(
+        machine_summary["downtime_hours"], errors="coerce"
+    ).sum(min_count=1) if "downtime_hours" in machine_summary.columns else np.nan
+    glance_availability = pd.to_numeric(
+        machine_summary["availability"], errors="coerce"
+    ).mean() if "availability" in machine_summary.columns else np.nan
+    glance_output_per_hour = pd.to_numeric(
+        machine_summary["output_per_hour"], errors="coerce"
+    ).mean() if "output_per_hour" in machine_summary.columns else np.nan
+    glance_speed = pd.to_numeric(
+        production_runs["speed_attainment_pct"], errors="coerce"
+    ).mean() if "speed_attainment_pct" in production_runs.columns else np.nan
+    glance_energy = pd.to_numeric(
+        machine_summary["energy_kwh"], errors="coerce"
+    ).sum(min_count=1) if "energy_kwh" in machine_summary.columns else np.nan
+    glance_energy_per_unit = (
+        glance_energy / glance_output
+        if pd.notna(glance_energy) and pd.notna(glance_output) and glance_output > 0
+        else np.nan
+    )
+    glance_energy_coverage = pd.to_numeric(
+        machine_summary["energy_coverage_pct"], errors="coerce"
+    ).mean() if "energy_coverage_pct" in machine_summary.columns else np.nan
     machine_columns = [
         "machine",
         "run_count",
@@ -2159,6 +2358,21 @@ def create_html_report(
         )
         profile_table_html = "<p class='empty'>No production-linked process parameter profile is available.</p>"
 
+    logo_path = Path(__file__).resolve().with_name("pi_systems_logo.png")
+    if logo_path.is_file():
+        logo_data = base64.b64encode(logo_path.read_bytes()).decode("ascii")
+        company_logo_html = (
+            f'<img class="company-logo" src="data:image/png;base64,{logo_data}" '
+            'alt="Pi Systems">'
+        )
+        company_mark_html = (
+            f'<img class="brand-logo" src="data:image/png;base64,{logo_data}" '
+            'alt="Pi Systems">'
+        )
+    else:
+        company_logo_html = '<span class="company-logo-text">PI SYSTEMS</span>'
+        company_mark_html = '<div class="brand-mark">PI</div>'
+
     report_path = output_dir / "eda_report.html"
     report = f"""<!doctype html>
 <html lang="en">
@@ -2167,42 +2381,114 @@ def create_html_report(
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Tube Mill EDA Report</title>
   <style>
-    :root {{ color-scheme: light; font-family: Segoe UI, Arial, sans-serif; color: #1f2937; background: #f3f6fa; }}
-    body {{ margin: 0; }}
-    header {{ background: #12324a; color: #fff; padding: 28px max(24px, calc((100% - 1180px) / 2)); }}
-    main {{ max-width: 1180px; margin: 24px auto; padding: 0 20px 40px; }}
-    section {{ background: #fff; border: 1px solid #e4e9ef; border-radius: 10px; padding: 22px; margin: 18px 0; }}
-    h1 {{ margin: 0 0 6px; }} h2 {{ margin-top: 0; color: #12324a; }}
+    :root {{ color-scheme: light; font-family: "Segoe UI", Arial, sans-serif; color: #172033; background: #eef3f8; }}
+    * {{ box-sizing: border-box; }}
+    body {{ margin: 0; background: #eef3f8; }}
+    .dashboard {{ min-height: 100vh; display: grid; grid-template-columns: 248px minmax(0, 1fr); }}
+    .sidebar {{ position: sticky; top: 0; height: 100vh; overflow-y: auto; background: linear-gradient(180deg, #0a1f33 0%, #102b46 100%); color: #fff; padding: 20px 14px; border-right: 1px solid rgba(255,255,255,.06); }}
+    .brand {{ display: flex; align-items: center; gap: 8px; padding: 2px 6px 16px; border-bottom: 1px solid rgba(255,255,255,.12); margin-bottom: 14px; }}
+    .brand-logo {{ width: 82px; height: 82px; object-fit: contain; border-radius: 8px; background: #08182a; }}
+    .brand-mark {{ width: 82px; height: 82px; border-radius: 8px; display: grid; place-items: center; background: #f59e0b; color: #102b46; font-weight: 800; }}
+    .brand strong {{ display: block; font-size: .88rem; letter-spacing: .01em; }}
+    .brand span {{ display: block; margin-top: 3px; color: #b9c9d8; font-size: .72rem; }}
+    .nav-label {{ color: #91a8bb; text-transform: uppercase; letter-spacing: .08em; font-size: .68rem; font-weight: 700; padding: 8px 10px 6px; }}
+    .side-nav {{ display: grid; gap: 3px; }}
+    .nav-button {{ width: 100%; border: 0; border-radius: 8px; background: transparent; color: #dce7f0; padding: 9px 10px; text-align: left; cursor: pointer; font: inherit; font-size: .86rem; transition: .15s ease; }}
+    .nav-button:hover {{ background: rgba(255,255,255,.08); color: #fff; }}
+    .nav-button.active {{ background: #f59e0b; color: #102b46; font-weight: 700; }}
+    .content {{ min-width: 0; }}
+    header {{ background: #fff; border-bottom: 1px solid #dde5ed; padding: 16px 28px; box-shadow: 0 2px 12px rgba(16,43,70,.03); }}
+    header h1 {{ margin: 0 0 4px; font-size: 1.45rem; color: #102b46; }}
+    header div {{ color: #667085; font-size: .84rem; }}
+    .header-inner {{ display: flex; align-items: center; justify-content: space-between; gap: 18px; width: 100%; }}
+    .header-copy {{ min-width: 0; }}
+    .company-logo {{ height: 54px; width: auto; object-fit: contain; flex: 0 0 auto; }}
+    .company-logo-text {{ color: #102b46; font-size: .78rem; font-weight: 800; letter-spacing: .08em; }}
+    main {{ max-width: 1180px; margin: 0 auto; padding: 24px 28px 40px; }}
+    main section {{ display: none; background: #fff; border: 1px solid #dde5ed; border-radius: 12px; padding: 22px; box-shadow: 0 5px 18px rgba(16,43,70,.05); }}
+    main section.active {{ display: block; animation: panel-in .18s ease-out; }}
+    @keyframes panel-in {{ from {{ opacity: 0; transform: translateY(4px); }} to {{ opacity: 1; transform: translateY(0); }} }}
+    h1 {{ margin: 0 0 6px; }} h2 {{ margin: 0 0 16px; color: #102b46; }}
     .muted, .empty, figcaption {{ color: #667085; }}
     .cards {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }}
-    .card {{ background: #f4f8fb; border-radius: 8px; padding: 16px; }}
-    .card strong {{ display: block; font-size: 1.5rem; margin-top: 6px; color: #12324a; }}
+    .card {{ background: #f4f8fb; border: 1px solid #e5edf4; border-radius: 10px; padding: 16px; transition: transform .15s ease, box-shadow .15s ease; }}
+    .card:hover {{ transform: translateY(-2px); box-shadow: 0 8px 18px rgba(16,43,70,.08); }}
+    .card strong {{ display: block; font-size: 1.45rem; margin-top: 6px; color: #102b46; }}
+    .card.status-good {{ background: #edf8f1; border-color: #bce2c8; }}
+    .card.status-good strong {{ color: #18794e; }}
+    .card.status-watch {{ background: #fff8e6; border-color: #efdba5; }}
+    .card.status-watch strong {{ color: #9a6700; }}
+    .status-banner {{ display: flex; align-items: flex-start; gap: 10px; margin-top: 16px; padding: 12px 14px; border-radius: 9px; background: #eef4fa; border-left: 4px solid #4a7fa6; color: #40566b; }}
+    .status-banner strong {{ color: #102b46; }}
+    .subtabs {{ display: flex; flex-wrap: wrap; gap: 8px; margin: 18px 0 14px; padding-bottom: 12px; border-bottom: 1px solid #e5ebf2; }}
+    .subtab-button {{ border: 1px solid #dbe4ec; background: #fff; color: #40566b; border-radius: 8px; padding: 8px 12px; cursor: pointer; font: inherit; font-size: .84rem; }}
+    .subtab-button.active {{ background: #102b46; border-color: #102b46; color: #fff; }}
+    .subpanel {{ display: none; }}
+    .subpanel.active {{ display: block; }}
     .data-table {{ border-collapse: collapse; width: 100%; font-size: .92rem; }}
     .data-table th, .data-table td {{ border-bottom: 1px solid #e5e7eb; padding: 9px 10px; text-align: left; }}
-    .data-table th {{ background: #f4f8fb; }}
-    .table-wrap {{ overflow-x: auto; }}
+    .data-table th {{ background: #f4f8fb; position: sticky; top: 0; z-index: 1; }}
+    .table-wrap {{ overflow-x: auto; max-height: 70vh; border: 1px solid #edf1f5; border-radius: 8px; }}
+    .table-wrap > .data-table {{ margin: 0; }}
     .charts {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 18px; }}
     figure.chart {{ margin: 0; }} figure.chart img {{ width: 100%; height: auto; }}
     figcaption {{ margin-top: 6px; text-align: center; }}
     .note {{ border-left: 4px solid #d99a19; padding: 10px 14px; background: #fff8e6; }}
-    @media print {{ body {{ background: #fff; }} section {{ break-inside: avoid; }} }}
+    .menu-toggle {{ display: none; }}
+    @media (max-width: 820px) {{
+      .dashboard {{ grid-template-columns: 1fr; }}
+      .sidebar {{ position: fixed; z-index: 20; width: 248px; transform: translateX(-100%); transition: transform .2s ease; box-shadow: 12px 0 30px rgba(16,43,70,.18); }}
+      .sidebar.open {{ transform: translateX(0); }}
+      .menu-toggle {{ display: inline-grid; place-items: center; width: 38px; height: 38px; border: 1px solid #dde5ed; border-radius: 8px; background: #fff; color: #102b46; cursor: pointer; margin-right: 10px; }}
+      header {{ display: flex; align-items: center; }}
+      header > div {{ flex: 1; }}
+      header h1 {{ font-size: 1.18rem; }}
+      .company-logo {{ height: 42px; }}
+      .header-inner {{ gap: 8px; }}
+      main {{ padding: 16px; }}
+    }}
+    @media print {{
+      .dashboard {{ display: block; }} .sidebar {{ display: none; }} header {{ display: block; }}
+      main section {{ display: block !important; break-inside: avoid; margin-bottom: 18px; }}
+      .table-wrap {{ max-height: none; }}
+    }}
   </style>
 </head>
 <body>
-  <header>
-    <h1>Tube Mill EDA Report</h1>
-    <div>Generated {html.escape(generated_at)} | Descriptive comparison across {len(machine_summary)} machines and {len(production_runs):,} production runs</div>
-  </header>
-  <main>
+  <div class="dashboard">
+    <aside class="sidebar" id="sidebar">
+      <div class="brand">
+        {company_mark_html}
+        <div><strong>Tube Mill Analytics</strong><span>Enterprise EDA Dashboard</span></div>
+      </div>
+      <div class="nav-label">Report sections</div>
+      <nav class="side-nav" id="sideNav" aria-label="Report sections"></nav>
+    </aside>
+    <div class="content">
+      <header>
+        <button class="menu-toggle" id="menuToggle" type="button" aria-label="Toggle menu" aria-controls="sidebar" aria-expanded="false">☰</button>
+        <div class="header-inner">
+          <div class="header-copy">
+            <h1>Tube Mill EDA Report</h1>
+            <div>Generated {html.escape(generated_at)} | Descriptive comparison across {len(machine_summary)} machines and {len(production_runs):,} production runs</div>
+          </div>
+          {company_logo_html}
+        </div>
+      </header>
+      <main>
     <section>
       <h2>At a glance</h2>
       <div class="cards">
-        <div class="card">Machines analyzed<strong>{len(machine_summary):,}</strong></div>
         <div class="card">Production runs<strong>{len(production_runs):,}</strong></div>
-        <div class="card">Efficient band<strong>{efficient_count}</strong></div>
-        <div class="card">Inefficient band<strong>{inefficient_count}</strong></div>
+        <div class="card">Produced quantity<strong>{format_number(glance_output)}</strong></div>
+        <div class="card status-watch">Scrap rate<strong>{format_number(glance_scrap_rate)}%</strong></div>
+        <div class="card status-watch">Recorded downtime<strong>{format_number(glance_downtime)} hours</strong></div>
+        <div class="card status-good">Availability<strong>{format_number(glance_availability * 100)}%</strong></div>
+        <div class="card">Matched energy<strong>{format_number(glance_energy)} kWh</strong></div>
+        <div class="card">Energy per produced unit<strong>{format_number(glance_energy_per_unit)} kWh/unit</strong></div>
+        <div class="card status-watch">Average speed vs target<strong>{format_number(glance_speed)}%</strong></div>
       </div>
-      {findings_html}
+      <div class="status-banner"><strong>Report scope:</strong><span>{len(machine_summary):,} machine, {glance_days:,} production days, {format_number(glance_energy_coverage)}% energy coverage. Machine ranking is unavailable because only one machine was found.</span></div>
     </section>
     <section>
       <h2>Business summary</h2>
@@ -2211,20 +2497,30 @@ def create_html_report(
     <section>
       <h2>Daily operating trends</h2>
       <p class="muted">Plant-wide daily totals. Run duration and matched energy are assigned to each production run's start date; downtime duration is assigned to each event's start date. Energy is matched by time window, not by meter-to-machine ID. Overlapping production windows may count energy more than once.</p>
-      <div class="table-wrap">{daily_table_html}</div>
-      {daily_chart_html}
-      <h3>Daily signal summary</h3>
-      {daily_signal_html}
+      <div class="subtabs" data-subtabs>
+        <button class="subtab-button active" type="button" data-subpanel="daily-table">Daily data</button>
+        <button class="subtab-button" type="button" data-subpanel="daily-chart">Chart</button>
+        <button class="subtab-button" type="button" data-subpanel="daily-signals">Signal summary</button>
+        <button class="subtab-button" type="button" data-subpanel="daily-process">Process tags</button>
+      </div>
+      <div class="subpanel active" id="daily-table">
+        <div class="table-wrap">{daily_table_html}</div>
+      </div>
+      <div class="subpanel" id="daily-chart">{daily_chart_html}</div>
+      <div class="subpanel" id="daily-signals">{daily_signal_html.split('<h4>Process tags for higher-energy, lower-downtime dates</h4>')[0]}</div>
+      <div class="subpanel" id="daily-process"><h3>Process tags for higher-energy, lower-downtime dates</h3>{process_tag_html}</div>
     </section>
     <section>
       <h2>Machine metrics</h2>
       <p class="muted">Machine-level descriptive metrics. A relative score is shown only when at least two machines have complete score inputs; efficiency bands require at least four.</p>
       <div class="table-wrap">{machine_table_html}</div>
+      <div class="charts">{efficiency_chart_html}{machine_correlation_chart_html}</div>
     </section>
     <section>
       <h2>Energy intensity</h2>
       <p>{energy_note} A single machine's energy intensity is a measurement, not a machine-to-machine ranking. Compare similar products and run conditions.</p>
       <div class="table-wrap">{energy_table_html}</div>
+      <div class="charts">{output_energy_chart_html}</div>
     </section>
     <section>
       <h2>EMS meter readings and run linkage</h2>
@@ -2248,6 +2544,7 @@ def create_html_report(
       <h2>Downtime reasons</h2>
       <p>{downtime_duration_note} Durations that cannot be interpreted are displayed as N/A, not zero.</p>
       <div class="table-wrap">{downtime_table_html}</div>
+      <div class="charts">{downtime_chart_html}</div>
     </section>
     <section>
       <h2>Speed attainment</h2>
@@ -2263,10 +2560,7 @@ def create_html_report(
       <h2>Process parameter differences</h2>
       <p class="muted">Each tag is first averaged within each linked production run, so runs with more change-triggered readings do not automatically get more weight. Standardized differences help compare tags with different units. These are associations, not proof of cause.</p>
       <div class="table-wrap">{factor_table_html}</div>
-    </section>
-    <section>
-      <h2>Charts</h2>
-      <div class="charts">{charts_html}</div>
+      <div class="charts">{process_gap_chart_html}</div>
     </section>
     <section>
       <h2>How to interpret these results</h2>
@@ -2281,7 +2575,83 @@ def create_html_report(
         Treat findings as investigation leads, not causal conclusions or operating instructions.
       </div>
     </section>
-  </main>
+      </main>
+    </div>
+  </div>
+  <script>
+    (function () {{
+      const sections = Array.from(document.querySelectorAll("main > section"));
+      const nav = document.getElementById("sideNav");
+      const sidebar = document.getElementById("sidebar");
+      const menuToggle = document.getElementById("menuToggle");
+
+      document.querySelectorAll("[data-subtabs]").forEach(tabGroup => {{
+        tabGroup.addEventListener("click", event => {{
+          const button = event.target.closest(".subtab-button");
+          if (!button) return;
+          const panelId = button.dataset.subpanel;
+          const section = tabGroup.closest("section");
+          tabGroup.querySelectorAll(".subtab-button").forEach(tab => {{
+            tab.classList.toggle("active", tab === button);
+          }});
+          section.querySelectorAll(":scope > .subpanel").forEach(panel => {{
+            panel.classList.toggle("active", panel.id === panelId);
+          }});
+        }});
+      }});
+
+      sections.forEach((section, index) => {{
+        const heading = section.querySelector("h2");
+        if (!heading) return;
+        const title = heading.textContent.trim();
+        const panelId = "panel-" + (index + 1);
+        section.id = panelId;
+        section.setAttribute("role", "tabpanel");
+
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "nav-button";
+        button.textContent = title;
+        button.dataset.target = panelId;
+        button.setAttribute("role", "tab");
+        button.setAttribute("aria-controls", panelId);
+        nav.appendChild(button);
+      }});
+
+      function showPanel(panelId) {{
+        sections.forEach(section => {{
+          const active = section.id === panelId;
+          section.classList.toggle("active", active);
+          section.setAttribute("aria-hidden", active ? "false" : "true");
+        }});
+        Array.from(nav.querySelectorAll(".nav-button")).forEach(button => {{
+          const active = button.dataset.target === panelId;
+          button.classList.toggle("active", active);
+          button.setAttribute("aria-selected", active ? "true" : "false");
+        }});
+        sidebar.classList.remove("open");
+        menuToggle.setAttribute("aria-expanded", "false");
+        if (window.location.hash !== "#" + panelId) {{
+          history.replaceState(null, "", "#" + panelId);
+        }}
+        window.scrollTo({{ top: 0, behavior: "smooth" }});
+      }}
+
+      nav.addEventListener("click", event => {{
+        const button = event.target.closest(".nav-button");
+        if (button) showPanel(button.dataset.target);
+      }});
+
+      menuToggle.addEventListener("click", () => {{
+        const open = sidebar.classList.toggle("open");
+        menuToggle.setAttribute("aria-expanded", open ? "true" : "false");
+      }});
+
+      const initial = window.location.hash;
+      const initialPanel = initial ? document.querySelector(initial) : null;
+      showPanel(initialPanel && sections.includes(initialPanel) ? initial.slice(1) : "panel-1");
+    }})();
+  </script>
 </body>
 </html>
 """
@@ -2423,6 +2793,7 @@ def main() -> None:
         downtime_duration_unit=args.downtime_duration_unit,
         ems_df=ems_df if not ems_df.empty else None,
         daily_summary=daily_summary,
+        process_df=process_df if not process_df.empty else None,
     )
 
     print("\nEDA complete.")
