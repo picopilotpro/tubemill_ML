@@ -2452,6 +2452,129 @@ def create_html_report(
       main section {{ display: block !important; break-inside: avoid; margin-bottom: 18px; }}
       .table-wrap {{ max-height: none; }}
     }}
+    /* Polished report shell */
+    :root {{
+      --slate-50: #f8fafc; --slate-100: #f1f5f9; --slate-200: #e2e8f0;
+      --slate-300: #cbd5e1; --slate-400: #94a3b8; --slate-500: #64748b;
+      --slate-600: #475569; --slate-700: #334155; --slate-800: #1e293b;
+      --slate-900: #0f172a; --blue-600: #2563eb; --amber-400: #fbbf24;
+      --amber-500: #f59e0b; --amber-700: #b45309; --green-500: #22c55e;
+      --green-700: #15803d; --shadow: 0 1px 3px rgb(15 23 42 / .07), 0 6px 16px rgb(15 23 42 / .05);
+    }}
+    :root {{ font-family: "Inter", "Segoe UI", Arial, sans-serif; }}
+    body {{ background: #f1f5f9; }}
+    .dashboard {{ grid-template-columns: 280px minmax(0, 1fr); }}
+    .sidebar {{
+      z-index: 30; gap: 14px; padding: 20px 14px 16px;
+      background: linear-gradient(180deg, #0f172a 0%, #0b2440 100%);
+      color: #cbd5e1;
+    }}
+    .brand {{ gap: 12px; padding: 0 6px 16px; border-bottom-color: rgba(255,255,255,.10); }}
+    .brand-logo, .brand-mark {{ width: 56px; height: 56px; border-radius: 8px; }}
+    .brand strong {{ color: #fff; font-size: .95rem; }}
+    .brand span {{ color: #94a3b8; font-size: .75rem; }}
+    .nav-label {{ color: #64748b; }}
+    .side-nav {{ gap: 2px; }}
+    .nav-button {{
+      position: relative; display: grid; grid-template-columns: 28px minmax(0, 1fr);
+      align-items: center; gap: 12px; min-height: 44px; padding: 8px 10px;
+      border-radius: 8px; color: #cbd5e1; font-size: .875rem; line-height: 1.3;
+    }}
+    .nav-button:hover {{ background: rgba(255,255,255,.06); color: #fff; }}
+    .nav-button.active {{ background: rgba(245,158,11,.14); color: #fff; font-weight: 600; }}
+    .nav-button .step-dot {{
+      display: grid; place-items: center; width: 28px; height: 28px; border-radius: 50%;
+      border: 1.5px solid #475569; background: #0f172a; color: #cbd5e1;
+      font-size: .75rem; font-weight: 700;
+    }}
+    .nav-button.active .step-dot {{ background: #f59e0b; border-color: #f59e0b; color: #0f172a; box-shadow: 0 0 0 4px rgba(245,158,11,.22); }}
+    .nav-button.is-done .step-dot {{ background: #16a34a; border-color: #16a34a; color: #fff; }}
+    .nav-button.is-done .step-dot::before {{ content: "✓"; }}
+    .nav-button.is-done .step-dot span {{ display: none; }}
+    .review {{ margin: 0 0 4px; padding: 12px; border: 1px solid rgba(255,255,255,.07); border-radius: 8px; background: rgba(255,255,255,.05); }}
+    .review-row {{ display: flex; justify-content: space-between; color: #cbd5e1; font-size: .75rem; font-weight: 600; }}
+    .review-row b {{ color: #fff; }}
+    .review-track {{ margin-top: 8px; height: 6px; overflow: hidden; border-radius: 99px; background: rgba(255,255,255,.10); }}
+    .review-track span {{ display: block; width: 9.09%; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #fbbf24, #22c55e); transition: width .3s ease; }}
+    .sidebar-foot {{ margin-top: auto; padding: 12px 8px 0; border-top: 1px solid rgba(255,255,255,.08); color: #94a3b8; font-size: .75rem; }}
+    kbd {{ display: inline-grid; min-width: 22px; height: 22px; place-items: center; margin-right: 4px; border: 1px solid rgba(255,255,255,.18); border-radius: 5px; color: #e2e8f0; }}
+    .content {{ background: #f1f5f9; }}
+    header {{
+      position: sticky; top: 0; z-index: 20; padding: 14px 32px;
+      background: rgba(255,255,255,.92); backdrop-filter: blur(10px); border-bottom: 1px solid #e2e8f0;
+      box-shadow: none;
+    }}
+    .header-inner {{ max-width: none; }}
+    header h1 {{ margin: 2px 0 6px; font-size: 1.375rem; line-height: 1.25; color: #0f172a; }}
+    .header-copy > div {{ display: flex; flex-wrap: wrap; gap: 6px; color: #64748b; }}
+    .header-copy > div {{ font-size: .75rem; }}
+    .eyebrow {{ margin: 0; color: #1d4ed8; font-size: .75rem; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; }}
+    .company-logo {{ height: 48px; }}
+    .print-btn {{ min-height: 38px; padding: 8px 14px; border: 1px solid #e2e8f0; border-radius: 8px; background: #fff; color: #475569; font-weight: 600; cursor: pointer; box-shadow: 0 1px 2px rgb(15 23 42 / .06); }}
+    .header-actions {{ display: flex; align-items: center; gap: 14px; }}
+    main {{ max-width: 1240px; padding: 28px 32px 48px; }}
+    main section {{
+      border: 1px solid #e2e8f0; border-radius: 12px; padding: 28px;
+      box-shadow: var(--shadow);
+    }}
+    main section h2 {{ margin: 4px 0 0; font-size: 1.375rem; color: #0f172a; }}
+    main section > h2 {{ margin: 0 0 16px; }}
+    main section .section-head {{ display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 18px; padding-bottom: 18px; border-bottom: 1px solid #f1f5f9; }}
+    main section .section-head h2 {{ margin: 4px 0 0; }}
+    main p {{ color: #64748b; line-height: 1.65; }}
+    .cards {{ grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 14px; }}
+    .card {{
+      position: relative; padding: 16px 18px; border: 1px solid #e2e8f0; border-radius: 12px;
+      background: #fff; color: #64748b; box-shadow: 0 1px 2px rgb(15 23 42 / .06);
+      overflow: hidden;
+    }}
+    .card::before {{ content: ""; position: absolute; inset: 0 auto 0 0; width: 3px; background: #cbd5e1; }}
+    .card strong {{ margin-top: 8px; color: #0f172a; font-size: clamp(1.2rem, 1.1rem + .5vw, 1.5rem); line-height: 1.2; }}
+    .card.status-good::before {{ background: #22c55e; }}
+    .card.status-good strong {{ color: #15803d; }}
+    .card.status-watch::before {{ background: #f59e0b; }}
+    .card.status-watch strong {{ color: #b45309; }}
+    .status-banner {{ margin-top: 18px; border: 1px solid #bfdbfe; border-left: 4px solid #3b82f6; border-radius: 8px; background: #eff6ff; }}
+    .subtabs {{ display: inline-flex; gap: 4px; padding: 4px; border: 1px solid #e2e8f0; border-radius: 10px; background: #f1f5f9; }}
+    .subtab-button {{ border: 0; border-radius: 7px; background: transparent; color: #475569; }}
+    .subtab-button.active {{ background: #fff; color: #0f172a; box-shadow: 0 1px 2px rgb(15 23 42 / .06), 0 0 0 1px #e2e8f0; }}
+    .table-wrap {{ border: 1px solid #e2e8f0; border-radius: 10px; }}
+    .data-table {{ border-collapse: separate; border-spacing: 0; }}
+    .data-table th {{ top: 0; background: #f8fafc; color: #475569; border-bottom: 1px solid #e2e8f0; }}
+    .data-table th, .data-table td {{ border-bottom: 1px solid #f1f5f9; }}
+    .charts {{ grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); }}
+    figure.chart {{ padding: 14px; border: 1px solid #e2e8f0; border-radius: 12px; background: #fff; box-shadow: 0 1px 2px rgb(15 23 42 / .06); }}
+    .section-foot {{ display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-top: 28px; padding-top: 20px; border-top: 1px solid #f1f5f9; }}
+    .section-foot .btn {{ min-height: 38px; padding: 8px 14px; border: 1px solid #e2e8f0; border-radius: 8px; background: #fff; color: #334155; font-weight: 600; cursor: pointer; }}
+    .section-foot .btn-primary {{ border-color: #2563eb; background: #2563eb; color: #fff; }}
+    @media (max-width: 1023.98px) {{
+      .dashboard {{ grid-template-columns: 84px minmax(0,1fr); }}
+      .sidebar {{ width: 84px; padding: 16px 12px; }}
+      .brand {{ justify-content: center; }}
+      .brand > div, .review, .nav-label, .sidebar-foot {{ display: none; }}
+      .nav-button {{ grid-template-columns: 1fr; justify-items: center; padding: 8px 0; }}
+      .nav-button .step-label {{ display: none; }}
+      header {{ padding: 12px 24px; }}
+      main {{ padding: 24px; }}
+    }}
+    @media (max-width: 767.98px) {{
+      .dashboard {{ grid-template-columns: 1fr; }}
+      .sidebar {{ position: fixed; inset: 0 auto 0 0; width: 280px; transform: translateX(-100%); transition: transform .22s ease; }}
+      .sidebar.open {{ transform: translateX(0); }}
+      .sidebar .brand > div, .sidebar .review, .sidebar .nav-label, .sidebar .sidebar-foot {{ display: block; }}
+      .nav-button {{ grid-template-columns: 28px minmax(0,1fr); justify-items: initial; }}
+      .nav-button .step-label {{ display: block; }}
+      header {{ padding: 12px 16px; }}
+      .company-logo, .print-btn {{ display: none; }}
+      main {{ padding: 16px; }}
+      main section {{ padding: 18px; }}
+      .cards {{ grid-template-columns: 1fr; }}
+      .charts {{ grid-template-columns: 1fr; }}
+    }}
+    @media print {{
+      .sidebar, .print-btn, .menu-toggle, .section-foot {{ display: none !important; }}
+      header {{ position: static; }}
+    }}
   </style>
 </head>
 <body>
@@ -2461,18 +2584,27 @@ def create_html_report(
         {company_mark_html}
         <div><strong>Tube Mill Analytics</strong><span>Enterprise EDA Dashboard</span></div>
       </div>
+      <div class="review">
+        <div class="review-row"><span>Sections reviewed</span><b id="reviewCount">1 / 11</b></div>
+        <div class="review-track"><span id="reviewBar"></span></div>
+      </div>
       <div class="nav-label">Report sections</div>
       <nav class="side-nav" id="sideNav" aria-label="Report sections"></nav>
+      <div class="sidebar-foot"><kbd>←</kbd><kbd>→</kbd> move between sections</div>
     </aside>
     <div class="content">
       <header>
         <button class="menu-toggle" id="menuToggle" type="button" aria-label="Toggle menu" aria-controls="sidebar" aria-expanded="false">☰</button>
         <div class="header-inner">
           <div class="header-copy">
+            <p class="eyebrow">Machine 10A701 · Descriptive EDA</p>
             <h1>Tube Mill EDA Report</h1>
             <div>Generated {html.escape(generated_at)} | Descriptive comparison across {len(machine_summary)} machines and {len(production_runs):,} production runs</div>
           </div>
-          {company_logo_html}
+          <div class="header-actions">
+            <button class="print-btn" id="printBtn" type="button">Print / PDF</button>
+            {company_logo_html}
+          </div>
         </div>
       </header>
       <main>
@@ -2608,10 +2740,27 @@ def create_html_report(
         section.id = panelId;
         section.setAttribute("role", "tabpanel");
 
+        const head = document.createElement("div");
+        head.className = "section-head";
+        head.innerHTML = `<div><p class="eyebrow">Step ${{index + 1}} of ${{sections.length}}</p></div><button class="print-btn" type="button" data-copy-link="${{panelId}}" aria-label="Copy link to ${{title}}">Copy link</button>`;
+        heading.replaceWith(head);
+        head.querySelector("div").appendChild(heading);
+
+        const foot = document.createElement("div");
+        foot.className = "section-foot";
+        if (index > 0) {{
+          foot.innerHTML += `<button class="btn" type="button" data-go="${{index - 1}}">← Previous</button>`;
+        }}
+        foot.innerHTML += `<span></span>`;
+        if (index < sections.length - 1) {{
+          foot.innerHTML += `<button class="btn btn-primary" type="button" data-go="${{index + 1}}">Next →</button>`;
+        }}
+        section.appendChild(foot);
+
         const button = document.createElement("button");
         button.type = "button";
         button.className = "nav-button";
-        button.textContent = title;
+        button.innerHTML = `<span class="step-dot"><span>${{index + 1}}</span></span><span class="step-label">${{title}}</span>`;
         button.dataset.target = panelId;
         button.setAttribute("role", "tab");
         button.setAttribute("aria-controls", panelId);
@@ -2625,10 +2774,18 @@ def create_html_report(
           section.setAttribute("aria-hidden", active ? "false" : "true");
         }});
         Array.from(nav.querySelectorAll(".nav-button")).forEach(button => {{
+          const activeIndex = Array.from(nav.querySelectorAll(".nav-button")).indexOf(button);
+          const currentIndex = sections.findIndex(section => section.id === panelId);
           const active = button.dataset.target === panelId;
           button.classList.toggle("active", active);
+          button.classList.toggle("is-done", activeIndex < currentIndex);
           button.setAttribute("aria-selected", active ? "true" : "false");
         }});
+        const currentIndex = sections.findIndex(section => section.id === panelId);
+        const reviewCount = document.getElementById("reviewCount");
+        const reviewBar = document.getElementById("reviewBar");
+        if (reviewCount) reviewCount.textContent = `${{currentIndex + 1}} / ${{sections.length}}`;
+        if (reviewBar) reviewBar.style.width = `${{((currentIndex + 1) / sections.length) * 100}}%`;
         sidebar.classList.remove("open");
         menuToggle.setAttribute("aria-expanded", "false");
         if (window.location.hash !== "#" + panelId) {{
@@ -2641,6 +2798,29 @@ def create_html_report(
         const button = event.target.closest(".nav-button");
         if (button) showPanel(button.dataset.target);
       }});
+
+      document.addEventListener("click", event => {{
+        const go = event.target.closest("[data-go]");
+        if (go) showPanel(sections[Number(go.dataset.go)].id);
+        const copy = event.target.closest("[data-copy-link]");
+        if (copy) {{
+          const url = window.location.href.split("#")[0] + "#" + copy.dataset.copyLink;
+          navigator.clipboard.writeText(url).catch(() => {{}});
+        }}
+      }});
+
+      document.addEventListener("keydown", event => {{
+        if (event.target.closest("input, textarea")) return;
+        const currentIndex = sections.findIndex(section => section.classList.contains("active"));
+        if (event.key === "ArrowRight" && currentIndex < sections.length - 1) {{
+          showPanel(sections[currentIndex + 1].id);
+        }} else if (event.key === "ArrowLeft" && currentIndex > 0) {{
+          showPanel(sections[currentIndex - 1].id);
+        }}
+      }});
+
+      const printButton = document.getElementById("printBtn");
+      if (printButton) printButton.addEventListener("click", () => window.print());
 
       menuToggle.addEventListener("click", () => {{
         const open = sidebar.classList.toggle("open");
