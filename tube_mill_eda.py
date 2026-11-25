@@ -8,6 +8,7 @@ import re
 import sqlite3
 import warnings
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from datetime import time as datetime_time
 from pathlib import Path
 from typing import Optional
@@ -1198,6 +1199,696 @@ def create_plots(
             plt.close()
 
 
+def calculate_prewindow_features(
+    timestamps: pd.Series,
+    values: pd.Series,
+    window_end: pd.Timestamp,
+    tag_normal_low: float,
+    tag_normal_high: float,
+    tag_normal_std: float,
+) -> dict[str, float | int | bool]:
+    timestamps = pd.to_datetime(timestamps, errors="coerce")
+    values = pd.to_numeric(values, errors="coerce")
+    valid = timestamps.notna() & values.notna()
+    timestamps = timestamps.loc[valid].sort_values()
+    values = values.loc[valid].reindex(timestamps.index)
+
+    if values.empty:
+        return {
+            "prediction_cutoff": window_end,
+            "first_reading_lead_minutes": np.nan,
+            "last_reading_lead_minutes": np.nan,
+            "post_prediction_readings": 0,
+            "causal_evidence": "insufficient_pre_stoppage_data",
+            "reading_count": 0,
+            "mean_value": np.nan,
+            "min_value": np.nan,
+            "max_value": np.nan,
+            "fluctuation": np.nan,
+            "start_to_end_change": np.nan,
+            "sudden_changes": 0,
+            "outside_normal_count": 0,
+            "outside_normal_pct": np.nan,
+            "missing_reading": True,
+            "stale_reading": True,
+        }
+
+    ordered_values = values.to_numpy(dtype=float)
+    diffs = np.diff(ordered_values)
+    sudden_threshold = max(float(tag_normal_std) * 2.0, np.finfo(float).eps)
+    sudden_changes = int(np.count_nonzero(np.abs(diffs) > sudden_threshold))
+    outside_mask = (ordered_values < tag_normal_low) | (ordered_values > tag_normal_high)
+    latest = timestamps.max()
+    earliest = timestamps.min()
+    stale = pd.isna(latest) or (window_end - latest).total_seconds() > 300
+    first_lead = (window_end - earliest).total_seconds() / 60.0
+    last_lead = (window_end - latest).total_seconds() / 60.0
+    post_prediction_readings = int((timestamps >= window_end).sum())
+    if post_prediction_readings:
+        causal_evidence = "contaminated_by_post_prediction_readings"
+    elif stale:
+        causal_evidence = "pre_stoppage_candidate_but_stale_reading"
+    else:
+        causal_evidence = "pre_stoppage_candidate"
+
+    return {
+        "prediction_cutoff": window_end,
+        "first_reading_lead_minutes": float(first_lead),
+        "last_reading_lead_minutes": float(last_lead),
+        "post_prediction_readings": post_prediction_readings,
+        "causal_evidence": causal_evidence,
+        "reading_count": int(len(ordered_values)),
+        "mean_value": float(np.mean(ordered_values)),
+        "min_value": float(np.min(ordered_values)),
+        "max_value": float(np.max(ordered_values)),
+        "fluctuation": float(np.std(ordered_values, ddof=1)) if len(ordered_values) > 1 else 0.0,
+        "start_to_end_change": float(ordered_values[-1] - ordered_values[0]),
+        "sudden_changes": sudden_changes,
+        "outside_normal_count": int(outside_mask.sum()),
+        "outside_normal_pct": float(outside_mask.mean() * 100.0),
+        "missing_reading": False,
+        "stale_reading": bool(stale),
+    }
+
+
+def classify_downtime_event(reason: object) -> tuple[str, bool]:
+    text = str(reason or "").strip().lower()
+    if not text:
+        return "unclassified", True
+
+    planned_patterns = (
+        r"\bbreakfast\b", r"\blunch\b", r"\bsupper\b", r"\bdinner\b",
+        r"\bmeal\b", r"\bchangeover\b", r"\bmodel change\b",
+        r"\bscheduled\b", r"\bmaintenance\b", r"\btool changeover\b",
+    )
+    if any(re.search(pattern, text) for pattern in planned_patterns):
+        return "planned_stoppage", False
+
+    adjustment_patterns = (
+        r"\bbutting\b", r"\boffset\b", r"\balignment\b",
+        r"\bcorrection\b", r"\badjustment\b", r"\btuning\b",
+    )
+    if any(re.search(pattern, text) for pattern in adjustment_patterns):
+        return "process_adjustment", False
+
+    return "unplanned_stoppage", True
+
+
+def create_downtime_pattern_dataset(
+    production_runs: pd.DataFrame,
+    downtime_df: Optional[pd.DataFrame],
+    process_df: Optional[pd.DataFrame],
+    output_dir: Path,
+    windows: tuple[int, ...] = (5, 10, 15),
+    max_tags: int = 20,
+    max_workers: int = 4,
+    max_events: int = 0,
+) -> dict[str, pd.DataFrame]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    feature_path = output_dir / "downtime_pattern_features.csv"
+    summary_path = output_dir / "downtime_pattern_summary.csv"
+    exclusion_path = output_dir / "downtime_pattern_exclusions.csv"
+    plot_path = output_dir / "downtime_process_patterns.png"
+    if plot_path.exists():
+        plot_path.unlink()
+    for path in (feature_path, summary_path, exclusion_path):
+        if path.exists():
+            path.unlink()
+
+    empty_features = pd.DataFrame()
+    empty_summary = pd.DataFrame()
+    empty_exclusions = pd.DataFrame()
+
+    if downtime_df is None or downtime_df.empty:
+        empty_exclusions = pd.DataFrame(
+            [{"reason": "No downtime data supplied", "excluded_events": 0, "data_quality": "No downtime rows"}]
+        )
+        empty_exclusions.to_csv(exclusion_path, index=False)
+        return {
+            "features": empty_features,
+            "summary": empty_summary,
+            "exclusions": empty_exclusions,
+        }
+
+    if process_df is None or process_df.empty:
+        empty_exclusions = pd.DataFrame(
+            [{"reason": "No process parameter data supplied", "excluded_events": int(len(downtime_df)), "data_quality": "No PLC/PLC-tag rows"}]
+        )
+        empty_exclusions.to_csv(exclusion_path, index=False)
+        return {
+            "features": empty_features,
+            "summary": empty_summary,
+            "exclusions": empty_exclusions,
+        }
+
+    down = downtime_df.copy()
+    proc = process_df.copy()
+
+    down_start_col = first_existing_column(down, ["begin_time", "downtime_start_time", "start_time", "event_start_time"])
+    down_end_col = first_existing_column(down, ["end_time", "downtime_end_time", "end_time"])
+    reason_col = first_existing_column(down, ["sub_loss_name", "main_loss_name", "reason", "downtime_reason"])
+    down_run_id_col = first_existing_column(down, ["product_ref_id", "transaction_id"])
+    down_machine_col = first_existing_column(down, ["eq_code", "eq_name", "eq_id", "equipment_id"])
+
+    proc_time_col = first_existing_column(proc, ["_timestamp", "timestamp", "date_time", "begin_time", "tm1_timestamp"])
+    proc_tag_col = first_existing_column(proc, ["_name", "name", "tag", "parameter"])
+    proc_value_col = first_existing_column(proc, ["_value", "value", "tag_value"])
+    proc_run_id_col = first_existing_column(proc, ["transaction_id", "product_ref_id", "route_card_no"])
+    proc_machine_col = first_existing_column(proc, ["equipment_id", "eq_code", "eq_id", "eq_name"])
+
+    if not all((down_start_col, proc_time_col, proc_tag_col, proc_value_col)):
+        empty_exclusions = pd.DataFrame(
+            [{
+                "reason": "Required timestamp or process-tag columns unavailable",
+                "excluded_events": int(len(down)),
+                "data_quality": "Missing downtime start, PLC timestamp, tag name, or tag value",
+            }]
+        )
+        empty_exclusions.to_csv(exclusion_path, index=False)
+        return {"features": empty_features, "summary": empty_summary, "exclusions": empty_exclusions}
+
+    down[down_start_col] = pd.to_datetime(down[down_start_col], errors="coerce")
+    if down_end_col:
+        down[down_end_col] = pd.to_datetime(down[down_end_col], errors="coerce")
+    proc[proc_time_col] = pd.to_datetime(proc[proc_time_col], errors="coerce")
+    proc[proc_value_col] = pd.to_numeric(proc[proc_value_col], errors="coerce")
+
+    proc = proc.loc[
+        proc[proc_time_col].notna()
+        & proc[proc_tag_col].notna()
+        & proc[proc_value_col].notna()
+    ].copy()
+    proc = proc.sort_values(proc_time_col)
+    proc_by_tag: dict[str, pd.DataFrame] = {}
+    for tag_name, tag_frame in proc.groupby(proc_tag_col, sort=False, dropna=False):
+        proc_by_tag[str(tag_name)] = tag_frame
+
+    run_start_col = first_existing_column(production_runs, ["prod_start_time", "begin_time", "start_time"])
+    run_end_col = first_existing_column(production_runs, ["prod_end_time", "end_time"])
+    run_id_col = first_existing_column(production_runs, ["product_ref_id", "transaction_id"])
+    run_machine_col = first_existing_column(production_runs, ["eq_code", "eq_name", "eq_id", "equipment_id"])
+    od_col = first_existing_column(production_runs, ["rolling_od", "od"])
+    thickness_col = first_existing_column(production_runs, ["rolling_thickness", "thickness"])
+    line_speed_col = first_existing_column(production_runs, ["actual_speed", "target_speed"])
+
+    if run_start_col:
+        production_runs = production_runs.copy()
+        production_runs[run_start_col] = pd.to_datetime(production_runs[run_start_col], errors="coerce")
+    if run_end_col:
+        production_runs[run_end_col] = pd.to_datetime(production_runs[run_end_col], errors="coerce")
+
+    tag_reading_counts = (
+        proc.groupby(proc_tag_col, dropna=False)[proc_value_col]
+        .count()
+        .sort_values(ascending=False)
+    )
+    all_tags = [
+        str(tag)
+        for tag in tag_reading_counts.head(max(1, max_tags)).index
+        if pd.notna(tag)
+    ]
+    print(
+        f"[Patterns] evaluating top {len(all_tags)} of "
+        f"{len(tag_reading_counts)} process tags by reading count",
+        flush=True,
+    )
+    exclusions: list[dict[str, object]] = []
+    feature_rows: list[dict[str, object]] = []
+
+    valid_down = down[down_start_col].notna()
+    if reason_col:
+        valid_down &= down[reason_col].notna()
+    down_events = down.loc[valid_down].copy()
+    if reason_col:
+        down_events["event_class"] = down_events[reason_col].apply(
+            lambda reason: classify_downtime_event(reason)[0]
+        )
+        event_is_predictive = down_events[reason_col].apply(
+            lambda reason: classify_downtime_event(reason)[1]
+        )
+        excluded_planned = down_events.loc[~event_is_predictive].copy()
+        planned_counts = (
+            excluded_planned.groupby(["event_class"], dropna=False)
+            .size()
+            .reset_index(name="excluded_events")
+        )
+        for row in planned_counts.to_dict("records"):
+            exclusions.append({
+                "reason": f"Excluded {row['event_class']}",
+                "excluded_events": int(row["excluded_events"]),
+                "data_quality": "Known planned or adjustment downtime; excluded from unplanned pattern prediction",
+            })
+        down_events = down_events.loc[event_is_predictive].copy()
+
+    if down_events.empty:
+        empty_exclusions = pd.DataFrame(
+            [{"reason": "No downtime events with valid start timestamps and reasons", "excluded_events": int(len(down)), "data_quality": "Insufficient downtime timestamps"}]
+        )
+        empty_exclusions.to_csv(exclusion_path, index=False)
+        return {"features": empty_features, "summary": empty_summary, "exclusions": empty_exclusions}
+
+    ordered_events = down_events.sort_values(down_start_col).reset_index(drop=True)
+    if max_events > 0:
+        ordered_events = ordered_events.head(max_events).copy()
+        print(
+            f"[Patterns] fast mode limited to first {len(ordered_events)} downtime events",
+            flush=True,
+        )
+    split_index = max(1, int(len(ordered_events) * 0.70))
+    healthy_runs_cache: dict[tuple[str, float, float, float], pd.DataFrame] = {}
+    normal_baseline_cache: dict[
+        tuple[str, float, float, float, int, str],
+        tuple[float, float, float, pd.Series],
+    ] = {}
+
+    for event_index, event in ordered_events.iterrows():
+        if event_index and event_index % 10 == 0:
+            print(
+                f"[Patterns] processed {event_index}/{len(ordered_events)} downtime events",
+                flush=True,
+            )
+        stoppage_start = event[down_start_col]
+        stoppage_end = event[down_end_col] if down_end_col and pd.notna(event[down_end_col]) else stoppage_start
+        reason = str(event[reason_col]).strip() if reason_col and pd.notna(event[reason_col]) else "Unspecified"
+        event_class = classify_downtime_event(reason)[0]
+        machine = str(event[down_machine_col]).strip() if down_machine_col and pd.notna(event[down_machine_col]) else ""
+        run_id = str(event[down_run_id_col]).strip() if down_run_id_col and pd.notna(event[down_run_id_col]) else ""
+
+        exclusion_reasons: list[str] = []
+        if not all_tags:
+            exclusion_reasons.append("No process parameter readings")
+
+        event_specs: dict[str, float] = {}
+        if run_id and run_id_col:
+            matching_runs = production_runs[
+                production_runs[run_id_col].astype("string").fillna("").str.strip() == run_id
+            ]
+            if not matching_runs.empty:
+                row = matching_runs.iloc[0]
+                if od_col:
+                    event_specs["od"] = pd.to_numeric(pd.Series([row[od_col]]), errors="coerce").iloc[0]
+                if thickness_col:
+                    event_specs["thickness"] = pd.to_numeric(pd.Series([row[thickness_col]]), errors="coerce").iloc[0]
+                if line_speed_col:
+                    event_specs["line_speed"] = pd.to_numeric(pd.Series([row[line_speed_col]]), errors="coerce").iloc[0]
+
+        od_key = float(event_specs["od"]) if pd.notna(event_specs.get("od")) else -1.0
+        thickness_key = float(event_specs["thickness"]) if pd.notna(event_specs.get("thickness")) else -1.0
+        line_speed_key = float(event_specs["line_speed"]) if pd.notna(event_specs.get("line_speed")) else -1.0
+        healthy_key = (
+            machine,
+            round(od_key, 3),
+            round(thickness_key, 3),
+            round(line_speed_key, 3),
+        )
+        if healthy_key not in healthy_runs_cache:
+            healthy_runs = production_runs
+            if run_machine_col and machine:
+                healthy_runs = healthy_runs[
+                    machine_id_match(healthy_runs[run_machine_col], machine)
+                ]
+            if od_col and pd.notna(event_specs.get("od")):
+                spec_od = pd.to_numeric(healthy_runs[od_col], errors="coerce")
+                healthy_runs = healthy_runs[np.isclose(spec_od, event_specs["od"], rtol=0.01, atol=0.01)]
+            if thickness_col and pd.notna(event_specs.get("thickness")):
+                spec_thickness = pd.to_numeric(healthy_runs[thickness_col], errors="coerce")
+                healthy_runs = healthy_runs[np.isclose(spec_thickness, event_specs["thickness"], rtol=0.02, atol=0.02)]
+            if line_speed_col and pd.notna(event_specs.get("line_speed")):
+                spec_line_speed = pd.to_numeric(healthy_runs[line_speed_col], errors="coerce")
+                healthy_runs = healthy_runs[np.isclose(
+                    spec_line_speed,
+                    event_specs["line_speed"],
+                    rtol=0.05,
+                    atol=0.5,
+                )]
+            healthy_runs_cache[healthy_key] = healthy_runs
+        healthy_runs = healthy_runs_cache[healthy_key]
+
+        for window_minutes in windows:
+            window_end = stoppage_start
+            window_start = stoppage_start - pd.Timedelta(minutes=window_minutes)
+
+            for tag in all_tags:
+                tag_frame = proc_by_tag.get(tag)
+                if tag_frame is None:
+                    continue
+                proc_window = tag_frame.loc[
+                    tag_frame[proc_time_col].ge(window_start)
+                    & tag_frame[proc_time_col].lt(window_end)
+                ].copy()
+
+                if proc_machine_col and machine:
+                    machine_number = pd.to_numeric(pd.Series([machine]), errors="coerce").iloc[0]
+                    if pd.notna(machine_number):
+                        proc_window = proc_window[
+                            machine_id_match(proc_window[proc_machine_col], machine)
+                        ]
+                if proc_run_id_col and run_id:
+                    linked_window = proc_window[
+                        proc_window[proc_run_id_col].astype("string").fillna("").str.strip() == run_id
+                    ]
+                    if not linked_window.empty:
+                        proc_window = linked_window
+                if proc_window.empty:
+                    continue
+
+                healthy_event_runs = healthy_runs
+                if run_start_col and run_end_col:
+                    overlap_mask = (
+                        healthy_event_runs[run_start_col].le(stoppage_end)
+                        & healthy_event_runs[run_end_col].ge(stoppage_start)
+                    )
+                    healthy_event_runs = healthy_event_runs.loc[
+                        healthy_event_runs[run_start_col].notna() & ~overlap_mask
+                    ]
+
+                normal_endpoints = []
+                if run_start_col:
+                    normal_endpoints = pd.to_datetime(
+                        healthy_event_runs[run_start_col], errors="coerce"
+                    ).dropna().tolist()
+                    if len(normal_endpoints) > 100:
+                        normal_endpoints = [
+                            normal_endpoints[index]
+                            for index in np.linspace(
+                                0, len(normal_endpoints) - 1, 100, dtype=int
+                            )
+                        ]
+
+                normal_cache_key = (
+                    machine,
+                    round(od_key, 3),
+                    round(thickness_key, 3),
+                    round(line_speed_key, 3),
+                    window_minutes,
+                    tag,
+                )
+                if normal_cache_key not in normal_baseline_cache:
+                    normal_values: list[pd.Series] = []
+                    def collect_normal_values(normal_end: pd.Timestamp) -> pd.Series:
+                        normal_start = normal_end - pd.Timedelta(minutes=window_minutes)
+                        normal_proc = tag_frame.loc[
+                            tag_frame[proc_time_col].ge(normal_start)
+                            & tag_frame[proc_time_col].lt(normal_end)
+                        ].copy()
+                        if proc_machine_col and machine:
+                            machine_number = pd.to_numeric(pd.Series([machine]), errors="coerce").iloc[0]
+                            if pd.notna(machine_number):
+                                normal_proc = normal_proc[
+                                    machine_id_match(normal_proc[proc_machine_col], machine)
+                                ]
+                        if not normal_proc.empty:
+                            return normal_proc[proc_value_col]
+                        return pd.Series(dtype=float)
+
+                    workers = max(1, max_workers)
+                    if len(normal_endpoints) > 1 and workers > 1:
+                        with ThreadPoolExecutor(max_workers=workers) as executor:
+                            normal_values = list(executor.map(
+                                collect_normal_values,
+                                normal_endpoints,
+                            ))
+                    else:
+                        normal_values = [
+                            collect_normal_values(normal_end)
+                            for normal_end in normal_endpoints
+                        ]
+                    normal_value_list = (
+                        pd.concat(normal_values, ignore_index=True)
+                        if normal_values
+                        else pd.Series(dtype=float)
+                    )
+                    normal_valid = pd.to_numeric(normal_value_list, errors="coerce").dropna()
+                    normal_baseline_cache[normal_cache_key] = (
+                        float(normal_valid.mean()) if not normal_valid.empty else np.nan,
+                        float(normal_valid.std(ddof=1)) if len(normal_valid) > 1 else 0.0,
+                        0.0,
+                        normal_valid,
+                    )
+
+                normal_baseline = normal_baseline_cache[normal_cache_key]
+                normal_std = normal_baseline[1]
+                normal_valid = normal_baseline[3]
+                if len(normal_valid) >= 8:
+                    normal_low = float(normal_valid.quantile(0.05))
+                    normal_high = float(normal_valid.quantile(0.95))
+                    normal_std = float(normal_valid.std(ddof=1)) if len(normal_valid) > 1 else 0.0
+                elif not normal_valid.empty:
+                    normal_low = float(normal_valid.min())
+                    normal_high = float(normal_valid.max())
+                    normal_std = float(normal_valid.std(ddof=1)) if len(normal_valid) > 1 else 0.0
+                else:
+                    global_valid = pd.to_numeric(tag_frame[proc_value_col], errors="coerce").dropna()
+                    normal_low = float(global_valid.quantile(0.05)) if len(global_valid) >= 8 else (float(global_valid.min()) if not global_valid.empty else float("-inf"))
+                    normal_high = float(global_valid.quantile(0.95)) if len(global_valid) >= 8 else (float(global_valid.max()) if not global_valid.empty else float("inf"))
+                    normal_std = float(global_valid.std(ddof=1)) if len(global_valid) > 1 else 0.0
+
+                features = calculate_prewindow_features(
+                    proc_window[proc_time_col],
+                    proc_window[proc_value_col],
+                    window_end,
+                    normal_low,
+                    normal_high,
+                    normal_std,
+                )
+                base_od = event_specs.get("od", np.nan)
+                base_thickness = event_specs.get("thickness", np.nan)
+                base_line_speed = event_specs.get("line_speed", np.nan)
+                normal_outside_mask = (
+                    (normal_valid.to_numpy(dtype=float) < normal_low)
+                    | (normal_valid.to_numpy(dtype=float) > normal_high)
+                ) if not normal_valid.empty else np.array([], dtype=bool)
+                feature_rows.append({
+                    "event_id": event_index,
+                    "is_stoppage": True,
+                    "validation_segment": "validation" if event_index >= split_index else "discovery",
+                    "downtime_start": stoppage_start,
+                    "downtime_end": stoppage_end,
+                    "machine": machine,
+                    "run_id": run_id,
+                    "downtime_reason": reason,
+                    "event_class": event_class,
+                    "od": base_od,
+                    "thickness": base_thickness,
+                    "line_speed": base_line_speed,
+                    "window_minutes": window_minutes,
+                    "lead_time_minutes": window_minutes,
+                    "process_tag": tag,
+                    **features,
+                    "normal_mean": float(normal_valid.mean()) if not normal_valid.empty else np.nan,
+                    "normal_std": float(normal_std),
+                    "normal_outside_pct": float(normal_outside_mask.mean() * 100.0) if normal_outside_mask.size else np.nan,
+                    "healthy_run_count": len(normal_endpoints),
+                })
+
+    features = pd.DataFrame(feature_rows)
+    if not features.empty:
+        features = features.sort_values(["downtime_start", "downtime_reason", "window_minutes", "process_tag"])
+        features.to_csv(feature_path, index=False)
+
+        summary_rows: list[dict[str, object]] = []
+        for (reason, tag, window_minutes), group in features.groupby(
+            ["downtime_reason", "process_tag", "window_minutes"], dropna=False
+        ):
+            valid = group.dropna(subset=["mean_value"])
+            normal_means = valid["mean_value"]
+            normal_change = valid["start_to_end_change"]
+            occurrence_before = float(
+                (valid["outside_normal_count"] > 0).mean() * 100.0
+            ) if not valid.empty else 0.0
+            std_value = float(valid["fluctuation"].mean()) if not valid.empty else 0.0
+
+            if valid.empty:
+                pattern = "Insufficient data"
+            else:
+                avg_change = float(normal_change.mean()) if normal_change.notna().any() else 0.0
+                avg_fluctuation = float(valid["fluctuation"].mean()) if valid["fluctuation"].notna().any() else 0.0
+                avg_outside = float(valid["outside_normal_pct"].mean()) if valid["outside_normal_pct"].notna().any() else 0.0
+                if avg_change < -0.05:
+                    pattern = "Repeated decrease"
+                elif avg_change > 0.05:
+                    pattern = "Repeated increase"
+                elif avg_outside >= 20.0:
+                    pattern = "Unusual fluctuation"
+                elif avg_fluctuation > 0:
+                    pattern = "Candidate variation"
+                else:
+                    pattern = "No clear pattern"
+
+            discovery = valid.loc[valid["validation_segment"] == "discovery"]
+            validation = valid.loc[valid["validation_segment"] == "validation"]
+            discovery_pct = float((discovery["outside_normal_count"] > 0).mean() * 100.0) if not discovery.empty else np.nan
+            validation_pct = float((validation["outside_normal_count"] > 0).mean() * 100.0) if not validation.empty else np.nan
+            linked_event_count = int(valid["event_id"].nunique())
+            normal_occurrence_pct = float(valid["normal_outside_pct"].mean()) if (
+                "normal_outside_pct" in valid.columns
+                and valid["normal_outside_pct"].notna().any()
+            ) else np.nan
+            false_warning_pct = normal_occurrence_pct
+            separation_pct = (
+                occurrence_before - normal_occurrence_pct
+                if pd.notna(normal_occurrence_pct)
+                else np.nan
+            )
+
+            if (
+                linked_event_count >= 5
+                and occurrence_before >= 70
+                and pd.notna(validation_pct)
+                and validation_pct >= 70
+                and pd.notna(separation_pct)
+                and separation_pct >= 20
+            ):
+                candidate_strength = "Strong candidate"
+                evidence_level = "Investigate with engineering validation"
+            elif (
+                linked_event_count >= 3
+                and occurrence_before >= 70
+                and pd.notna(separation_pct)
+                and separation_pct >= 15
+            ):
+                candidate_strength = "Moderate candidate"
+                evidence_level = "Prioritize for review"
+            elif linked_event_count >= 2:
+                candidate_strength = "Weak candidate"
+                evidence_level = "Collect more stoppage events"
+            else:
+                candidate_strength = "Insufficient evidence"
+                evidence_level = "Do not operationalize"
+
+            summary_rows.append({
+                "downtime_reason": reason,
+                "event_class": "unplanned_stoppage",
+                "process_tag": tag,
+                "window_minutes": int(window_minutes),
+                "linked_events": int(valid["event_id"].nunique()),
+                "causal_evidence": (
+                    valid["causal_evidence"].mode().iloc[0]
+                    if "causal_evidence" in valid.columns and not valid["causal_evidence"].mode().empty
+                    else "insufficient_pre_stoppage_data"
+                ),
+                "mean_last_reading_lead_minutes": (
+                    float(valid["last_reading_lead_minutes"].mean())
+                    if "last_reading_lead_minutes" in valid.columns
+                    and valid["last_reading_lead_minutes"].notna().any()
+                    else np.nan
+                ),
+                "post_prediction_readings": (
+                    int(valid["post_prediction_readings"].fillna(0).sum())
+                    if "post_prediction_readings" in valid.columns
+                    else 0
+                ),
+                "occurrence_before_stoppages_pct": occurrence_before,
+                "occurrence_during_normal_operation_pct": normal_occurrence_pct,
+                "false_warning_occurrence_pct": false_warning_pct,
+                "separation_pct": separation_pct,
+                "candidate_strength": candidate_strength,
+                "evidence_level": evidence_level,
+                "mean_before_stoppage": float(normal_means.mean()) if not normal_means.empty else np.nan,
+                "mean_start_to_end_change": float(normal_change.mean()) if not normal_change.empty else np.nan,
+                "mean_fluctuation": std_value,
+                "discovery_occurrence_pct": discovery_pct,
+                "validation_occurrence_pct": validation_pct,
+                "pattern": pattern,
+                "lead_time_minutes": int(window_minutes),
+                "false_warning_occurrence": (
+                    f"{false_warning_pct:.2f}%"
+                    if pd.notna(false_warning_pct)
+                    else "Unavailable"
+                ),
+            })
+
+        summary = pd.DataFrame(summary_rows)
+        if not summary.empty:
+            summary["occurrence_before_stoppages_pct"] = pd.to_numeric(summary["occurrence_before_stoppages_pct"], errors="coerce").round(2)
+            summary = summary.sort_values(
+                ["occurrence_before_stoppages_pct", "downtime_reason", "process_tag"],
+                ascending=[False, True, True],
+            )
+            summary.to_csv(summary_path, index=False)
+
+            plot_data = summary.dropna(
+                subset=["occurrence_before_stoppages_pct"]
+            ).head(12).copy()
+            plot_data["occurrence_during_normal_operation_pct"] = pd.to_numeric(
+                plot_data["occurrence_during_normal_operation_pct"], errors="coerce"
+            ).fillna(0)
+            plot_data["label"] = (
+                plot_data["process_tag"].astype(str).str.slice(0, 38)
+                + " | "
+                + plot_data["window_minutes"].astype(int).astype(str)
+                + " min"
+            )
+            plot_data = plot_data.iloc[::-1]
+            y = np.arange(len(plot_data))
+            height = 0.38
+
+            fig, axis = plt.subplots(figsize=(12, max(6, len(plot_data) * 0.48)))
+            axis.barh(
+                y - height / 2,
+                plot_data["occurrence_before_stoppages_pct"],
+                height,
+                color="#2563eb",
+                label="Before stoppages",
+            )
+            axis.barh(
+                y + height / 2,
+                plot_data["occurrence_during_normal_operation_pct"],
+                height,
+                color="#94a3b8",
+                label="Normal operation",
+            )
+            axis.set_yticks(y)
+            axis.set_yticklabels(plot_data["label"], fontsize=9)
+            axis.set_xlim(0, 100)
+            axis.set_xlabel("Occurrence outside normal range (%)")
+            axis.set_title("Top Downtime Process Patterns")
+            axis.legend(loc="lower right")
+            axis.grid(axis="x", alpha=0.25)
+
+            for index, row in enumerate(plot_data.itertuples(index=False)):
+                before = pd.to_numeric(row.occurrence_before_stoppages_pct, errors="coerce")
+                normal = pd.to_numeric(row.occurrence_during_normal_operation_pct, errors="coerce")
+                if pd.notna(before):
+                    axis.text(before + 1, index - height / 2, f"{before:.0f}%", va="center", fontsize=8)
+                if pd.notna(normal):
+                    axis.text(normal + 1, index + height / 2, f"{normal:.0f}%", va="center", fontsize=8)
+
+            fig.text(
+                0.5,
+                0.01,
+                "Candidate patterns only: pre-stoppage changes are not proof of cause.",
+                ha="center",
+                fontsize=8,
+                color="#64748b",
+            )
+            fig.tight_layout(rect=(0, 0.05, 1, 1))
+            fig.savefig(plot_path, dpi=150)
+            plt.close(fig)
+        else:
+            summary = pd.DataFrame()
+    else:
+        summary = pd.DataFrame()
+
+    if exclusion_reasons:
+        pass
+    exclusions.append({
+        "reason": "No qualifying stoppage-level process pattern",
+        "excluded_events": int(len(down_events)),
+        "data_quality": "No valid process features generated",
+    }) if features.empty else None
+    exclusions_df = pd.DataFrame(exclusions)
+    if exclusions_df.empty:
+        exclusions_df = pd.DataFrame([{
+            "reason": "No exclusions",
+            "excluded_events": 0,
+            "data_quality": "All qualifying downtime events evaluated",
+        }])
+    exclusions_df.to_csv(exclusion_path, index=False)
+
+    return {"features": features, "summary": summary if not features.empty else empty_summary, "exclusions": exclusions_df}
+
+
 def create_factor_tables(
     production_runs: pd.DataFrame,
     machine_summary: pd.DataFrame,
@@ -1729,6 +2420,18 @@ def create_html_report(
             ascending=[False, False],
             na_position="last",
         ).head(40)
+    pattern_summary_path = output_dir / "downtime_pattern_summary.csv"
+    pattern_summary = (
+        pd.read_csv(pattern_summary_path).head(40)
+        if pattern_summary_path.is_file()
+        else pd.DataFrame()
+    )
+    pattern_exclusion_path = output_dir / "downtime_pattern_exclusions.csv"
+    pattern_exclusions = (
+        pd.read_csv(pattern_exclusion_path).head(20)
+        if pattern_exclusion_path.is_file()
+        else pd.DataFrame()
+    )
     report_machines = machine_summary.copy()
     report_machines["scrap_rate_pct"] = report_machines["scrap_rate"] * 100
     report_machines["availability_pct"] = report_machines["availability"] * 100
@@ -2357,6 +3060,116 @@ def create_html_report(
             "run IDs; readings without a run link are not included in this run-level profile."
         )
         profile_table_html = "<p class='empty'>No production-linked process parameter profile is available.</p>"
+    if not pattern_summary.empty:
+        rank_order = {"Strong candidate": 0, "Moderate candidate": 1, "Weak candidate": 2, "Insufficient evidence": 3}
+        business_view = pattern_summary.copy()
+        business_view["_rank"] = business_view["candidate_strength"].map(rank_order).fillna(99)
+        business_view["_before"] = pd.to_numeric(
+            business_view["occurrence_before_stoppages_pct"], errors="coerce"
+        ).fillna(0)
+        business_view = business_view.sort_values(
+            ["_rank", "_before", "linked_events"],
+            ascending=[True, False, False],
+        ).head(6)
+        business_cards_html = ""
+        for row in business_view.to_dict("records"):
+            strength = str(row.get("candidate_strength", "Insufficient evidence"))
+            reason = str(row.get("downtime_reason", "Unspecified reason"))
+            tag = str(row.get("process_tag", "Unknown process tag"))
+            before = row.get("occurrence_before_stoppages_pct")
+            normal = row.get("occurrence_during_normal_operation_pct")
+            lead = row.get("lead_time_minutes")
+            status_class = (
+                "status-good"
+                if strength == "Strong candidate"
+                else "status-watch"
+                if strength in ("Moderate candidate", "Weak candidate")
+                else ""
+            )
+            business_cards_html += (
+                f"<div class='card {status_class}'>"
+                f"{html.escape(reason)}"
+                f"<strong>{html.escape(tag)}</strong>"
+                f"<span>{html.escape(str(row.get('pattern', 'Pattern unavailable')))} · "
+                f"{html.escape(str(before))}% before stoppage · "
+                f"{html.escape(str(normal))}% during normal operation · "
+                f"{html.escape(str(lead))}-minute window</span>"
+                f"</div>"
+            )
+        if not business_cards_html:
+            business_cards_html = "<p class='empty'>No business-level candidate is available.</p>"
+        pattern_table_html = table_html(
+            pattern_summary,
+            [
+                "downtime_reason",
+                "event_class",
+                "process_tag",
+                "window_minutes",
+                "linked_events",
+                "occurrence_before_stoppages_pct",
+                "occurrence_during_normal_operation_pct",
+                "mean_before_stoppage",
+                "mean_start_to_end_change",
+                "mean_fluctuation",
+                "discovery_occurrence_pct",
+                "validation_occurrence_pct",
+                "causal_evidence",
+                "mean_last_reading_lead_minutes",
+                "post_prediction_readings",
+                "candidate_strength",
+                "evidence_level",
+                "separation_pct",
+                "false_warning_occurrence_pct",
+                "pattern",
+                "lead_time_minutes",
+            ],
+            digits=3,
+            labels={
+                "downtime_reason": "Downtime reason",
+                "event_class": "Event classification",
+                "process_tag": "Process tag",
+                "window_minutes": "Window (minutes)",
+                "linked_events": "Linked events",
+                "occurrence_before_stoppages_pct": "Before stoppages (%)",
+                "occurrence_during_normal_operation_pct": "Normal operation (%)",
+                "mean_before_stoppage": "Mean before stoppage",
+                "mean_start_to_end_change": "Start-to-end change",
+                "mean_fluctuation": "Mean fluctuation",
+                "discovery_occurrence_pct": "Discovery occurrence (%)",
+                "validation_occurrence_pct": "Later-period validation (%)",
+                "causal_evidence": "Causal evidence status",
+                "mean_last_reading_lead_minutes": "Mean last-reading lead (minutes)",
+                "post_prediction_readings": "Post-prediction readings",
+                "candidate_strength": "Business confidence",
+                "evidence_level": "Recommended action",
+                "separation_pct": "Stoppage-minus-normal gap (%)",
+                "false_warning_occurrence_pct": "False-warning occurrence (%)",
+                "pattern": "Pattern",
+                "lead_time_minutes": "Lead time (minutes)",
+            },
+        )
+    else:
+        pattern_table_html = (
+            "<p class='empty'>No stoppage/process pattern is available. "
+            "Supply downtime start timestamps and process readings with timestamps and tag values.</p>"
+        )
+    pattern_chart_html = image_html(
+        "downtime_process_patterns.png",
+        "Top downtime process patterns",
+    )
+    if not pattern_exclusions.empty:
+        pattern_exclusion_html = table_html(
+            pattern_exclusions,
+            ["reason", "excluded_events", "data_quality"],
+            digits=0,
+            labels={
+                "reason": "Exclusion reason",
+                "excluded_events": "Excluded events",
+                "data_quality": "Data quality",
+            },
+        )
+    else:
+        pattern_exclusion_html = "<p class='empty'>No pattern exclusions were recorded.</p>"
 
     logo_path = Path(__file__).resolve().with_name("pi_systems_logo.png")
     if logo_path.is_file():
@@ -2597,7 +3410,7 @@ def create_html_report(
         <button class="menu-toggle" id="menuToggle" type="button" aria-label="Toggle menu" aria-controls="sidebar" aria-expanded="false">☰</button>
         <div class="header-inner">
           <div class="header-copy">
-            <p class="eyebrow">Machine 10A701 · Descriptive EDA</p>
+            <p class="eyebrow">{len(machine_summary)} machine(s) · Descriptive EDA</p>
             <h1>Tube Mill EDA Report</h1>
             <div>Generated {html.escape(generated_at)} | Descriptive comparison across {len(machine_summary)} machines and {len(production_runs):,} production runs</div>
           </div>
@@ -2677,6 +3490,19 @@ def create_html_report(
       <p>{downtime_duration_note} Durations that cannot be interpreted are displayed as N/A, not zero.</p>
       <div class="table-wrap">{downtime_table_html}</div>
       <div class="charts">{downtime_chart_html}</div>
+    </section>
+    <section>
+      <h2>Downtime process patterns</h2>
+      <p class="muted">Business view: which process stage or sensor changed before downtime, how often it also appeared during normal operation, and whether enough repeated events support investigation. Planned meal breaks, tool/changeover events, scheduled maintenance, and adjustment reasons such as butting-offset correction are excluded from unplanned-failure candidates. A candidate is not proof of cause. Readings after the stoppage timestamp are excluded from pre-stoppage evidence.</p>
+      <h3>Business candidates</h3>
+      <div class="cards">{business_cards_html}</div>
+      <div class="status-banner"><strong>How to use this:</strong><span>Strong candidate = at least 5 linked events, repeated pre-stoppage behavior, and later-period validation. Moderate candidate = at least 3 events with a meaningful difference from normal operation. Weak candidate = only limited evidence. Insufficient evidence = do not operationalize.</span></div>
+      <h3>Pattern summary</h3>
+      <div class="table-wrap">{pattern_table_html}</div>
+      <h3>Graphical comparison</h3>
+      <div class="charts">{pattern_chart_html}</div>
+      <h3>Exclusions and data quality</h3>
+      <div class="table-wrap">{pattern_exclusion_html}</div>
     </section>
     <section>
       <h2>Speed attainment</h2>
@@ -2865,6 +3691,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ppc-path", default=None, help="Path to Tube Mill PPC file (optional).")
     parser.add_argument("--ppc-table", default=None, help="Table name when PPC input is SQL/SQLite.")
     parser.add_argument("--ppc-sheet", default=None, help="Sheet name when PPC input is Excel.")
+    parser.add_argument(
+        "--pattern-max-tags",
+        type=int,
+        default=20,
+        help="Maximum number of highest-volume process tags evaluated for downtime patterns.",
+    )
+    parser.add_argument(
+        "--pattern-max-workers",
+        type=int,
+        default=4,
+        help="Maximum concurrent workers used while collecting normal-operation PLC windows.",
+    )
+    parser.add_argument(
+        "--pattern-max-events",
+        type=int,
+        default=0,
+        help="Maximum downtime events to analyze. Use 0 to analyze every event.",
+    )
 
     parser.add_argument("--output-dir", default="eda_outputs", help="Directory where outputs are written.")
     parser.add_argument(
@@ -2954,6 +3798,21 @@ def main() -> None:
         machine_summary=machine_summary,
         process_df=process_df if not process_df.empty else None,
         output_dir=output_dir,
+    )
+    print("[Patterns] building downtime/process pattern dataset...", flush=True)
+    pattern_result = create_downtime_pattern_dataset(
+        production_runs=production_runs,
+        downtime_df=downtime_df if not downtime_df.empty else None,
+        process_df=process_df if not process_df.empty else None,
+        output_dir=output_dir,
+        max_tags=args.pattern_max_tags,
+        max_workers=args.pattern_max_workers,
+        max_events=args.pattern_max_events,
+    )
+    print(
+        f"[Patterns] complete: {len(pattern_result['features'])} event/window/tag rows, "
+        f"{len(pattern_result['summary'])} pattern rows",
+        flush=True,
     )
     print("[Plots] generating charts...", flush=True)
     create_plots(
