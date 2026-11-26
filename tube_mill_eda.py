@@ -1294,6 +1294,108 @@ def classify_downtime_event(reason: object) -> tuple[str, bool]:
     return "unplanned_stoppage", True
 
 
+def create_downtime_stage_trend_plot(
+    stage_data: pd.DataFrame,
+    downtime_data: pd.DataFrame,
+    process_time_col: str,
+    process_value_col: str,
+    downtime_start_col: str,
+    downtime_end_col: Optional[str],
+    process_tag: str,
+    output_path: Path,
+    max_points: int = 1200,
+) -> dict[str, object]:
+    if stage_data.empty:
+        return {}
+
+    trend = (
+        stage_data[[process_time_col, process_value_col]]
+        .dropna(subset=[process_time_col, process_value_col])
+        .set_index(process_time_col)[process_value_col]
+        .sort_index()
+    )
+    if trend.empty:
+        return {}
+
+    span_seconds = max(0.0, (trend.index[-1] - trend.index[0]).total_seconds())
+    bucket_minutes = max(1, int(np.ceil(span_seconds / (max_points * 60))))
+    trend = trend.resample(f"{bucket_minutes}min").median().dropna()
+    if trend.empty:
+        return {}
+
+    smoothed = trend.rolling(window=7, min_periods=1).median()
+    start_time = trend.index[0]
+    end_time = trend.index[-1]
+    intervals: list[tuple[float, float]] = []
+    undated_ends: list[float] = []
+    if downtime_start_col in downtime_data.columns:
+        columns = [downtime_start_col]
+        if downtime_end_col and downtime_end_col in downtime_data.columns:
+            columns.append(downtime_end_col)
+        events = downtime_data[columns].dropna(subset=[downtime_start_col])
+        for event in events.itertuples(index=False, name=None):
+            event_start = event[0]
+            event_end = event[1] if len(event) > 1 else pd.NaT
+            if pd.notna(event_end) and event_end > event_start:
+                if event_end < start_time or event_start > end_time:
+                    continue
+                clipped_end = min(event_end, end_time)
+                clipped_start = max(event_start, start_time)
+                width = mdates.date2num(pd.Timestamp(clipped_end).to_pydatetime()) - mdates.date2num(
+                    pd.Timestamp(clipped_start).to_pydatetime()
+                )
+                if width > 0:
+                    intervals.append(
+                        (mdates.date2num(pd.Timestamp(clipped_start).to_pydatetime()), width)
+                    )
+            elif start_time <= event_start <= end_time:
+                start_num = mdates.date2num(pd.Timestamp(event_start).to_pydatetime())
+                undated_ends.append(start_num)
+
+    fig, (axis, timeline) = plt.subplots(
+        2,
+        1,
+        figsize=(14, 6.2),
+        sharex=True,
+        gridspec_kw={"height_ratios": [4, 0.7]},
+    )
+    fig.patch.set_facecolor("#f8fafc")
+    axis.set_facecolor("#ffffff")
+    axis.fill_between(trend.index, trend.to_numpy(), smoothed.to_numpy(), color="#14b8a6", alpha=0.12)
+    axis.plot(trend.index, trend.to_numpy(), color="#0f766e", linewidth=1.1, alpha=0.55, label="Binned readings")
+    axis.plot(smoothed.index, smoothed.to_numpy(), color="#0f766e", linewidth=2.2, label="7-bin rolling median")
+    axis.set_ylabel("Process value")
+    axis.set_title(f"Single-stage process trend · {process_tag}", loc="left", color="#102b46", fontweight="bold")
+    axis.grid(axis="y", color="#dbe4ec", linewidth=0.8, alpha=0.8)
+    axis.spines[["top", "right"]].set_visible(False)
+    axis.legend(loc="upper left", frameon=False, ncol=2)
+
+    if intervals:
+        timeline.broken_barh(intervals, (0.18, 0.64), facecolors="#f59e0b", alpha=0.9)
+    if undated_ends:
+        timeline.vlines(undated_ends, 0.12, 0.88, color="#dc2626", linewidth=1.2)
+    timeline.set_ylim(0, 1)
+    timeline.set_yticks([])
+    timeline.set_ylabel("Downtime", rotation=0, labelpad=35, va="center")
+    timeline.spines[["top", "right", "left"]].set_visible(False)
+    timeline.spines["bottom"].set_color("#cbd5e1")
+    locator = mdates.AutoDateLocator(minticks=4, maxticks=9)
+    timeline.xaxis.set_major_locator(locator)
+    timeline.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+    timeline.set_xlabel("Time")
+    fig.tight_layout(pad=1.4)
+    fig.savefig(output_path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    return {
+        "process_tag": process_tag,
+        "minimum": float(trend.min()),
+        "maximum": float(trend.max()),
+        "zero_bins": int(trend.eq(0).sum()),
+        "total_bins": int(len(trend)),
+        "bucket_minutes": bucket_minutes,
+    }
+
+
 def create_downtime_pattern_dataset(
     production_runs: pd.DataFrame,
     downtime_df: Optional[pd.DataFrame],
@@ -1309,8 +1411,10 @@ def create_downtime_pattern_dataset(
     summary_path = output_dir / "downtime_pattern_summary.csv"
     exclusion_path = output_dir / "downtime_pattern_exclusions.csv"
     plot_path = output_dir / "downtime_process_patterns.png"
-    if plot_path.exists():
-        plot_path.unlink()
+    stage_trend_path = output_dir / "downtime_stage_trend.png"
+    for path in (plot_path, stage_trend_path):
+        if path.exists():
+            path.unlink()
     for path in (feature_path, summary_path, exclusion_path):
         if path.exists():
             path.unlink()
@@ -1356,7 +1460,7 @@ def create_downtime_pattern_dataset(
     proc_run_id_col = first_existing_column(proc, ["transaction_id", "product_ref_id", "route_card_no"])
     proc_machine_col = first_existing_column(proc, ["equipment_id", "eq_code", "eq_id", "eq_name"])
 
-    if not all((down_start_col, proc_time_col, proc_tag_col, proc_value_col)):
+    if down_start_col is None or proc_time_col is None or proc_tag_col is None or proc_value_col is None:
         empty_exclusions = pd.DataFrame(
             [{
                 "reason": "Required timestamp or process-tag columns unavailable",
@@ -1870,6 +1974,27 @@ def create_downtime_pattern_dataset(
     else:
         summary = pd.DataFrame()
 
+    stage_tag = ""
+    if not summary.empty and "process_tag" in summary.columns:
+        candidate_tag = summary.iloc[0]["process_tag"]
+        if pd.notna(candidate_tag):
+            stage_tag = str(candidate_tag)
+    if not stage_tag and all_tags:
+        stage_tag = all_tags[0]
+    stage_frame = proc_by_tag.get(stage_tag)
+    stage_trend_stats = {}
+    if stage_frame is not None:
+        stage_trend_stats = create_downtime_stage_trend_plot(
+            stage_data=stage_frame,
+            downtime_data=down,
+            process_time_col=proc_time_col,
+            process_value_col=proc_value_col,
+            downtime_start_col=down_start_col,
+            downtime_end_col=down_end_col,
+            process_tag=stage_tag,
+            output_path=stage_trend_path,
+        )
+
     if exclusion_reasons:
         pass
     exclusions.append({
@@ -1886,7 +2011,12 @@ def create_downtime_pattern_dataset(
         }])
     exclusions_df.to_csv(exclusion_path, index=False)
 
-    return {"features": features, "summary": summary if not features.empty else empty_summary, "exclusions": exclusions_df}
+    return {
+        "features": features,
+        "summary": summary if not features.empty else empty_summary,
+        "exclusions": exclusions_df,
+        "stage_trend_stats": pd.DataFrame([stage_trend_stats]) if stage_trend_stats else pd.DataFrame(),
+    }
 
 
 def create_factor_tables(
@@ -2014,6 +2144,7 @@ def create_html_report(
     ems_df: Optional[pd.DataFrame] = None,
     daily_summary: Optional[pd.DataFrame] = None,
     process_df: Optional[pd.DataFrame] = None,
+    stage_trend_stats: Optional[pd.DataFrame] = None,
 ) -> Path:
     if daily_summary is None:
         daily_summary = create_daily_summary(
@@ -3157,6 +3288,29 @@ def create_html_report(
         "downtime_process_patterns.png",
         "Top downtime process patterns",
     )
+    stage_trend_html = image_html(
+        "downtime_stage_trend.png",
+        "Single-stage process trend with downtime",
+    )
+    stage_summary_html = ""
+    if stage_trend_html and stage_trend_stats is not None and not stage_trend_stats.empty:
+        stats = stage_trend_stats.iloc[0]
+        stage_summary_html = (
+            "<div class='trend-summary'><strong>Business summary</strong>"
+            f"<p><b>What happened:</b> The displayed tag, {html.escape(str(stats['process_tag']))}, "
+            f"ranged from {format_number(stats['minimum'])} to {format_number(stats['maximum'])} "
+            "in the grouped readings (source units). "
+            f"{int(stats['zero_bins']):,} of {int(stats['total_bins']):,} non-empty "
+            f"{int(stats['bucket_minutes']):,}-minute intervals had a median value of zero.</p>"
+            "<p><b>How to read it:</b> The thin line shows grouped readings; the thicker line "
+            "smooths the latest seven intervals with readings. Orange bands show recorded downtime; "
+            "red marks show starts without a valid end time.</p>"
+            "<p><b>What to do:</b> Check whether changes consistently happen before relevant "
+            "downtime, rather than during it or during normal operation. Downtime shown may not "
+            "all relate to this tag, and the graph alone does not establish cause.</p></div>"
+        )
+    if not stage_trend_html:
+        stage_trend_html = "<p class='empty'>No single-stage process trend is available for this report.</p>"
     if not pattern_exclusions.empty:
         pattern_exclusion_html = table_html(
             pattern_exclusions,
@@ -3226,13 +3380,16 @@ def create_html_report(
     .cards {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }}
     .card {{ background: #f4f8fb; border: 1px solid #e5edf4; border-radius: 10px; padding: 16px; transition: transform .15s ease, box-shadow .15s ease; }}
     .card:hover {{ transform: translateY(-2px); box-shadow: 0 8px 18px rgba(16,43,70,.08); }}
-    .card strong {{ display: block; font-size: 1.45rem; margin-top: 6px; color: #102b46; }}
+    .card strong {{ display: block; font-size: 1.45rem; margin-top: 6px; color: #102b46; overflow-wrap: anywhere; }}
     .card.status-good {{ background: #edf8f1; border-color: #bce2c8; }}
     .card.status-good strong {{ color: #18794e; }}
     .card.status-watch {{ background: #fff8e6; border-color: #efdba5; }}
     .card.status-watch strong {{ color: #9a6700; }}
     .status-banner {{ display: flex; align-items: flex-start; gap: 10px; margin-top: 16px; padding: 12px 14px; border-radius: 9px; background: #eef4fa; border-left: 4px solid #4a7fa6; color: #40566b; }}
     .status-banner strong {{ color: #102b46; }}
+    .trend-summary {{ margin: 12px 0 16px; padding: 16px 18px; border: 1px solid #b8e4de; border-left: 4px solid #0f766e; border-radius: 9px; background: #f0faf8; color: #334e5c; line-height: 1.55; }}
+    .trend-summary > strong {{ color: #0f766e; font-size: 1rem; }}
+    .trend-summary p {{ margin: 8px 0 0; }}
     .subtabs {{ display: flex; flex-wrap: wrap; gap: 8px; margin: 18px 0 14px; padding-bottom: 12px; border-bottom: 1px solid #e5ebf2; }}
     .subtab-button {{ border: 1px solid #dbe4ec; background: #fff; color: #40566b; border-radius: 8px; padding: 8px 12px; cursor: pointer; font: inherit; font-size: .84rem; }}
     .subtab-button.active {{ background: #102b46; border-color: #102b46; color: #fff; }}
@@ -3501,6 +3658,10 @@ def create_html_report(
       <div class="table-wrap">{pattern_table_html}</div>
       <h3>Graphical comparison</h3>
       <div class="charts">{pattern_chart_html}</div>
+      <h3>Single-stage trend with downtime</h3>
+      {stage_summary_html}
+      <p class="muted">The highest-ranked process tag is shown as a time-binned trend to keep large process datasets responsive. Orange bands mark downtime intervals; red markers indicate events without a valid end time.</p>
+      <div class="charts">{stage_trend_html}</div>
       <h3>Exclusions and data quality</h3>
       <div class="table-wrap">{pattern_exclusion_html}</div>
     </section>
@@ -3833,6 +3994,7 @@ def main() -> None:
         ems_df=ems_df if not ems_df.empty else None,
         daily_summary=daily_summary,
         process_df=process_df if not process_df.empty else None,
+        stage_trend_stats=pattern_result.get("stage_trend_stats"),
     )
 
     print("\nEDA complete.")
